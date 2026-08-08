@@ -298,20 +298,30 @@ async def on_ready():
 
 
 class RaidDetailsModal(discord.ui.Modal, title="Raid Loot Details"):
-    data = discord.ui.TextInput(
-        label="Gold / items / stamps / stamp price",
-        style=discord.TextStyle.paragraph,
-        default=TEMPLATE_EXAMPLE,
-        required=True,
-        max_length=4000,
-    )
-
-    def __init__(self, selected_members):
+    def __init__(self, selected_members, default_title: str):
         super().__init__()
         self.selected_members = selected_members
+        self.default_title = default_title
+
+        self.title_input = discord.ui.TextInput(
+            label="Thread title",
+            style=discord.TextStyle.short,
+            default=default_title,
+            required=True,
+            max_length=100,
+        )
+        self.data_input = discord.ui.TextInput(
+            label="Gold / items / stamps / stamp price",
+            style=discord.TextStyle.paragraph,
+            default=TEMPLATE_EXAMPLE,
+            required=True,
+            max_length=4000,
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.data_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        raw = str(self.data.value)
+        raw = str(self.data_input.value)
         try:
             parsed = parse_raid_details(raw, self.selected_members)
         except RaidParseError as e:
@@ -359,7 +369,11 @@ class RaidDetailsModal(discord.ui.Modal, title="Raid Loot Details"):
 
         now = datetime.datetime.now(datetime.timezone.utc)
         created_ts = int(now.timestamp())
-        thread_name = f"Raid Loot - {now.strftime('%Y-%m-%d %H:%M UTC')}"
+
+        thread_title = str(self.title_input.value).strip()
+        if not thread_title:
+            thread_title = self.default_title
+        thread_name = thread_title[:100]
 
         try:
             thread = await channel.create_thread(
@@ -453,7 +467,9 @@ class PlayerSelectView(discord.ui.View):
             )
             return
         selected_members = list(select.values)
-        modal = RaidDetailsModal(selected_members)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        default_title = f"Raid Loot - {now.strftime('%Y-%m-%d %H:%M UTC')}"
+        modal = RaidDetailsModal(selected_members, default_title)
         await interaction.response.send_modal(modal)
 
 
