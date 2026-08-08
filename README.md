@@ -119,7 +119,15 @@ click it and select every player who was in the raid (up to 25), the same
 way you'd pick people for a Discord role.
 
 **Step 2 — Fill in loot details.** As soon as you finish selecting
-players, a popup form opens with a pre-filled template — edit it in place:
+players, a popup form opens with two fields:
+
+- **Thread title** — pre-filled with a default like
+  `Raid Loot - 2026-08-04 06:10 UTC` (the time you opened the form). Leave
+  it as-is to use that default, or type your own title (e.g.
+  `Weekly Dungeon - Team A`). Max 100 characters (Discord's thread name
+  limit) — anything longer gets cut off.
+- **Gold / items / stamps / stamp price** — the loot data template, edited
+  the same as before:
 
 ```
 gold: 258
@@ -128,7 +136,7 @@ stamps: Player1:3:Gdn_ring, Player2:1:Gdn_ear
 stampprice: 4
 ```
 
-Field notes:
+Field notes for the loot data:
 - `gold:` — flat gold that doesn't need selling/stamping. Use `0` if none.
 - `items:` — comma-separated list of items that need to be sold later.
   **Item names must use underscores instead of spaces** (e.g. `Gdn_ring`,
