@@ -1,8 +1,8 @@
 # Raid Loot Share Bot
 
-A Discord bot that tracks raid loot, lets you mark items as sold, and
-automatically calculates each player's share (with stamp bonuses) using
-this formula:
+A Discord bot that tracks raid loot in a thread, lets you record drops and
+sales as they happen, and automatically calculates each player's share
+(with stamp bonuses) once everything is sold, using this formula:
 
 ```
 Net Pool   = Gold + Total Sold Price − (Total Stamps × Stamp Price)
@@ -19,8 +19,10 @@ Stamper's Share = Base Share + (Their Stamps × Stamp Price)
 3. In the left sidebar, click **Bot** → **Add Bot** (or it may already exist).
 4. Click **Reset Token** / **Copy** to get your bot token. **Keep this secret** —
    never share it or commit it to GitHub.
-5. No privileged intents are required for this bot (it does not read
-   message content or need the members intent) — you can leave those toggles off.
+5. No privileged intents are required for this bot. It does not read
+   general message content — reading `@mentions` from a message does **not**
+   require the Message Content intent (mentions are delivered as separate
+   metadata regardless), so you can leave all privileged intent toggles off.
 
 ## 2. Invite the Bot to Your Server
 
@@ -29,14 +31,17 @@ Stamper's Share = Base Share + (Their Stamps × Stamp Price)
    - `bot`
    - `applications.commands`
 3. Under **Bot Permissions**, check:
+   - `View Channels`
    - `Send Messages`
-   - `Create Public Threads`
    - `Send Messages in Threads`
-   - `Read Message History`
-   - `Manage Threads` (needed to auto-archive/close a raid thread once everyone confirms)
+   - `Read Message History` (needed to read the thread's first message for player mentions)
+   - `Manage Threads` (needed to auto-archive a raid thread once everyone confirms)
    - `Use Slash Commands` (implied by `applications.commands`)
 4. Copy the generated URL at the bottom, open it in your browser, and
    invite the bot to your server.
+
+Note: the bot no longer creates threads itself — you create the thread,
+so `Create Public Threads` isn't required for the bot.
 
 ## 3. Install & Run
 
@@ -66,37 +71,6 @@ file is optional, just convenient for local use.
 **Keep `.env` private** — never commit it to GitHub or share it. If you use
 git, add `.env` to your `.gitignore`.
 
-### Optional: pin raid threads to one specific channel
-
-By default, `/raid start` creates its thread in whichever channel you ran
-the command from. If you want people to *trigger* the command from a
-general channel (e.g. `#bot-command`) but have the thread always show up
-under a different channel (e.g. `#salary-loot`), set this before running
-the bot:
-
-```bash
-export RAID_THREAD_CHANNEL_ID="123456789012345678"   # the target channel's ID
-```
-
-To get a channel ID: enable Developer Mode in Discord (User Settings →
-Advanced → Developer Mode), then right-click the channel → **Copy Channel
-ID**.
-
-With this set, `/raid start` can be run from any channel the bot can see,
-but the thread — and every `/sold`, `/raid status`, `/raid cancel` command
-after it (since those run *inside* the thread) — will live under the
-target channel, keeping `#bot-command` clutter-free.
-
-**Permissions needed for this to work:** the bot needs "Create Public
-Threads" and "Send Messages in Threads" specifically on the *target*
-channel (e.g. `#salary-loot`), and just "Use Application Commands" /
-"Send Messages" on the trigger channel (e.g. `#bot-command`).
-
-If it connects successfully you'll see something like:
-```
-Logged in as LootShareBot#1234. Synced 2 command(s).
-```
-
 Slash commands can take up to an hour to appear globally the first time;
 if you don't see them right away, try kicking and re-inviting the bot, or
 wait a bit. Restarting the bot re-syncs commands each time it starts.
@@ -108,94 +82,128 @@ The bot stores raid data as JSON files under `data/raids/` next to
 
 ## How to Use
 
-### 1. Start a raid — `/raid start`
+### 1. Create the thread yourself
 
-This is a two-step flow (Discord's popup forms can't resolve `@mentions`
-typed as plain text, so player selection uses a real user picker instead):
-
-**Step 1 — Select players.** Run `/raid start` in a normal text channel
-(not inside a thread). You'll get an ephemeral message with a dropdown —
-click it and select every player who was in the raid (up to 25), the same
-way you'd pick people for a Discord role.
-
-**Step 2 — Fill in loot details.** As soon as you finish selecting
-players, a popup form opens with two fields:
-
-- **Thread title** — pre-filled with a default like
-  `Raid Loot - 2026-08-04 06:10 UTC` (the time you opened the form). Leave
-  it as-is to use that default, or type your own title (e.g.
-  `Weekly Dungeon - Team A`). Max 100 characters (Discord's thread name
-  limit) — anything longer gets cut off.
-- **Gold / items / stamps / stamp price** — the loot data template, edited
-  the same as before:
+Manually create a Discord thread for the raid (title it however you like),
+and in the **very first message** of that thread, `@mention` every player
+who participated:
 
 ```
-gold: 258
-items: Gdn_ring x34, Gdn_ear x34
-stamps: Player1:3:Gdn_ring, Player2:1:Gdn_ear
-stampprice: 4
+@Player1 @Player2 @Player3 @Player4
 ```
 
-Field notes for the loot data:
-- `gold:` — flat gold that doesn't need selling/stamping. Use `0` if none.
-- `items:` — comma-separated list of items that need to be sold later.
-  **Item names must use underscores instead of spaces** (e.g. `Gdn_ring`,
-  not `Gdn ring`). You can add an optional note like `x34` after the name
-  — it's just cosmetic and doesn't affect the math.
-- `stamps:` — comma-separated `PlayerName:count:item_name` entries for who
-  stamped what. `PlayerName` must match the **display name** (server
-  nickname) or username of one of the players you selected in Step 1 —
-  no `@` needed (one is tolerated if you type it out of habit). Leave it
-  as `stamps:` (empty) or `stamps: none` if nothing needed stamping.
-- `stampprice:` — gold cost per stamp at the time of the raid.
+This message is what the bot reads to figure out the player roster —
+double check everyone is mentioned before moving on.
 
-Submitting the form creates a new thread (named `Raid Loot - <date/time>`)
-and posts a summary of the raid + a reminder of the `/sold` command to use.
+Both ways of creating the thread work:
 
-> Note: if two selected players happen to share the exact same display
-> name, the bot can't tell them apart by name in `stamps:` and will ask
-> you to resolve it (e.g. temporarily use their username instead, or
-> rename one of them in-server).
+- **Threads button → Create → type the message** (the message you type
+  becomes the thread's first message).
+- **Right-click an existing message → Create Thread** (that original
+  message becomes the thread's "starter message" — the bot specifically
+  checks for this case too, since Discord treats it differently from a
+  normal first message).
 
-If anything is formatted wrong (bad item name, unknown player in a stamp
-entry, etc.), the bot replies with a specific error message plus the
-template example — nothing gets created until the data is valid.
+If you use the right-click method, make sure the message you're creating
+the thread _from_ is the one with the player mentions — that's the one
+the bot will read.
 
-### 2. Mark items as sold — `/sold`
+### 2. Start tracking — `/raid new`
 
-Inside the raid thread, once the party lead sells an item, run:
+Inside that same thread, run:
 
 ```
-/sold item:Gdn_ring price:1000
+/raid new stampprice:5
 ```
 
-- `item` must match a name from the original `items:` list exactly
-  (underscores, not spaces). If you mistype it, the bot tells you the
-  remaining unsold items so you can retry.
-- Once **every** item has been marked sold, the bot automatically
-  calculates and posts the full payout breakdown in the thread, mentioning
-  every player, e.g.:
+- `stampprice` — gold cost per stamp for this entire raid (set once here;
+  it does not change per item).
+- The bot reads the thread's first message to detect players. If it can't
+  find any mentions, or the thread has no messages yet, it tells you
+  exactly what's wrong so you can fix it and retry.
+- On success, the bot posts a confirmation in the thread listing the
+  detected players and stamp price, plus the commands you'll use next.
+
+### 3. Record loot — `/drop`
+
+Run once per item collected:
 
 ```
-⚔️ Raid Loot Share | 8 Players
-━━━━━━━━━━━━━━━━━━━━━
-💎 Gold  →  258G
-💎 Gdn_ring (x34)  →  522G
-💎 Gdn_ear (x34)  →  2,637G
-━━━━━━━━━━━━━━━━━━━━━
-🔖 Stamp Deduction  →  −16G  (4 stamps × 4G)
-💰 Net Pool         →  3,401G
-👥 Base Share       →  425.13G each
-━━━━━━━━━━━━━━━━━━━━━
-📋 Payout
-🏅 @Player1  →  437.13G  (+12G stamp bonus)
-🏅 @Player2  →  429.13G  (+4G stamp bonus)
-🏅 @Player3  →  425.13G
-...
-━━━━━━━━━━━━━━━━━━━━━
+/drop item_name:Sword stamp_qty:3 stamper:@H
 ```
 
-### 3. Confirm you've been paid — `/confirm`
+- `item_name` — free text, any spaces/characters are fine (no underscore
+  requirement — this isn't parsed from a bigger block of text anymore).
+- `stamp_qty` — how many stamps this item needed (default `0` if none).
+- `stamper` — the player who paid for the stamp. Required if `stamp_qty`
+  is greater than 0; must be someone on the raid's player list.
+- **One item = one stamper.** If two different players stamp items with
+  the same name, run `/drop` separately for each — they'll show up as
+  separate stock entries.
+- Dropping the **same item name by the same stamper again** merges into
+  that stack: quantity goes up (`x2`, `x3`, ...) and stamp counts add
+  together (e.g. two drops of 3 stamps each = 6 total stamps for that
+  stack).
+- Each successful `/drop` posts a confirmation with that drop's own stamp
+  cost, plus the full current remaining (unsold) stock list.
+
+### 4. Record extra gold — `/gold`
+
+```
+/gold amount:258
+```
+
+Sets the raid's flat gold amount. **Each call overwrites the previous
+value** — it does not add up, so if you need to correct it, just run it
+again with the right total.
+
+### 5. Sell an item — `/sell`
+
+```
+/sell
+```
+
+This opens a dropdown (visible only to you) listing every stock line that
+still has unsold units. Pick one, and a popup asks for two things:
+
+- **Quantity sold** — pre-filled with the full remaining amount for that
+  line; edit it down if you're only selling part of the stack (e.g. 1 out
+  of 3 available).
+- **Sold price (total for this batch)** — the total gold for the quantity
+  you're selling in _this_ transaction, not a per-unit price. If the rest
+  of the stack sells later at a different price, just run `/sell` again
+  for the remaining units — each sale is tracked separately and all of
+  them add up toward the final payout.
+
+Selling fewer than the full remaining amount marks that line **PARTIALLY
+SOLD** with the reduced remaining quantity; selling the last remaining
+unit marks it **SOLD**. Each sale posts a confirmation with the updated
+stock list in the thread.
+
+**Once every unit across every dropped stack has been sold**, the bot
+automatically calculates the full payout and posts it — no extra command
+needed. (There's currently no manual "force calculate" — if a raid has
+nothing to sell at all, just don't run `/raid new`/`/drop` for it; this
+bot is meant for raids that do have sellable loot.)
+
+### 6. Check current stock — `/stock`
+
+```
+/stock
+```
+
+Posts publicly in the thread (visible to everyone, not just you): every
+drop recorded so far — item name, quantity, stamper + stamp count, and
+status. Status is one of:
+
+- **AVAILABLE** — nothing sold from this stack yet
+- **PARTIALLY SOLD** — some units sold, some still remain (shows the
+  remaining quantity, plus how much has sold so far and for how much)
+- **SOLD** — fully sold (shown as `x0`)
+
+Plus the current raid gold total.
+
+### 7. Confirm you've been paid — `/confirm`
 
 Once the payout has been calculated and posted, each player runs
 `/confirm` in the thread to acknowledge they received their share:
@@ -211,51 +219,42 @@ Once the payout has been calculated and posted, each player runs
   later, which automatically reopens/unarchives it (e.g. for a late
   correction).
 
-### 5. Force-confirm a player — `/raid forceconfirm`
+### 8. Force-confirm a player — `/raid forceconfirm`
 
-Sometimes a player receives their share but never runs `/confirm` (they
-forget, go offline, etc). The **raid creator or a server admin** can run
+Sometimes a player receives their share but never runs `/confirm`. The
+**raid creator or a server admin** can run
 `/raid forceconfirm player:@PlayerName` inside the thread to manually mark
-that player as confirmed on their behalf. This counts the same as if the
-player had run `/confirm` themselves, including triggering the automatic
-close if they were the last one needed.
+that player as confirmed on their behalf. This counts the same as a real
+`/confirm`, including triggering the automatic close if they were the
+last one needed.
 
-### 6. Check progress — `/raid status`
+### 9. Check raid status — `/raid status`
 
-Run inside a raid thread anytime to see which items are sold/unsold
-(private/ephemeral reply, only visible to you). Once loot is calculated,
-this also shows who has and hasn't confirmed yet.
+Shows the raid's current phase (`in_progress` / `completed` / `closed`),
+when it started, and — once loot is calculated — who has and hasn't
+confirmed yet.
 
-### 7. Cancel a raid — `/raid cancel`
+### 10. Cancel a raid — `/raid cancel`
 
-Run inside a raid thread to delete its data (only the raid creator or a
-server admin can do this). Useful if the data was entered wrong and you
-want to start over with `/raid start`.
+Deletes this thread's raid data entirely (only the raid creator or a
+server admin can do this). Useful for starting over after a mistake.
 
 ---
 
-## Restricting where `/raid start` can be used
-
-This is native Discord functionality, no code needed: **Server Settings →
-Integrations → find this bot → Command Permissions**. From there an admin
-can allow/deny specific slash commands in specific channels or for
-specific roles. If `/raid start` isn't showing up in a channel you
-expect, check here first, then check the bot's channel permission
-overwrites for "Use Application Commands".
-
 ## Notes & Limitations
 
-- Each thread holds exactly one raid; running `/raid start` again just
-  creates a new, separate thread/raid.
-- A "gold only" raid (no `items:`) calculates and posts the payout
-  immediately after `/raid start`, since there's nothing left to sell.
-- All numbers support decimals (e.g. `stampprice: 4.5`) if your game ever
-  needs it, though gold is normally whole numbers.
-- Timestamps (raid start, loot calculated, raid closed) are posted using
-  Discord's dynamic timestamp format, so every player automatically sees
-  them converted to their own local time zone — there's no single "server
-  time" concept in Discord, so this is the accurate equivalent. Only the
-  thread's *title* stays in plain UTC text, since Discord doesn't support
-  live-rendered timestamps in channel/thread names, only in message text.
+- Each thread holds exactly one raid. Every command (`/drop`, `/gold`,
+  `/sell`, `/stock`, `/confirm`, and the `/raid ...` subcommands) must be
+  run **inside** that raid's thread.
+- `/drop` and `/gold` stop working once the raid's loot has been
+  calculated (status `completed` or `closed`) — no changes after the
+  payout is posted.
+- Timestamps (loot calculated, raid closed) use Discord's dynamic
+  timestamp format, so every player automatically sees them converted to
+  their own local time zone.
 - If you ever need to reset everything, stop the bot and delete the
   `data/raids/` folder — this wipes all raid history.
+- **Upgrade note:** this version changed how drops are stored internally
+  (to support partial sales). Any raid created with an older version of
+  this bot won't be readable by this version — cancel it with
+  `/raid cancel` and start fresh with `/raid new` after upgrading.
