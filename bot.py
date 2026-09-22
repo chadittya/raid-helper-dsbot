@@ -133,18 +133,18 @@ def all_fully_sold(raid: dict) -> bool:
     return all(group_remaining(g) == 0 for g in drops)
 
 
-def calculate_and_format(raid: dict) -> str:
+def compute_payout(raid: dict) -> dict:
     drops = raid["drops"]
     sales = raid.get("sales", [])
     gold = raid["gold"]
     stampprice = raid["stampprice"]
-    players = raid["players"]
-    num_players = len(players)
+    num_players = len(raid["players"])
 
     total_sold = sum(s["price"] for s in sales)
     total_stamps = sum(group_total_stamp_qty(g) for g in drops)
     stamp_deduction = total_stamps * stampprice
-    net_pool = gold + total_sold - stamp_deduction
+    total_before_deduction = gold + total_sold
+    net_pool = total_before_deduction - stamp_deduction
     base_share = net_pool / num_players if num_players else 0
 
     bonus_by_player = {}
@@ -154,6 +154,25 @@ def calculate_and_format(raid: dict) -> str:
             bonus_by_player[g["stamper_id"]] = bonus_by_player.get(
                 g["stamper_id"], 0
             ) + stamp_qty * stampprice
+
+    return {
+        "gold": gold,
+        "total_sold": total_sold,
+        "total_before_deduction": total_before_deduction,
+        "total_stamps": total_stamps,
+        "stamp_deduction": stamp_deduction,
+        "net_pool": net_pool,
+        "base_share": base_share,
+        "bonus_by_player": bonus_by_player,
+    }
+
+
+def calculate_and_format(raid: dict) -> str:
+    drops = raid["drops"]
+    sales = raid.get("sales", [])
+    players = raid["players"]
+    num_players = len(players)
+    payout = compute_payout(raid)
 
     # Aggregate sold amounts per item name for a clean payout summary line
     item_totals = {}
@@ -177,34 +196,90 @@ def calculate_and_format(raid: dict) -> str:
     if completed_ts:
         lines.append(f"🕒 Calculated: <t:{completed_ts}:F> (<t:{completed_ts}:R>)")
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"💎 Gold  →  {fmt_gold(gold)}G")
+    lines.append(f"💎 Gold  →  {fmt_gold(payout['gold'])}G")
     for name in item_order:
         t = item_totals[name]
         lines.append(f"💎 {name} (x{t['qty']})  →  {fmt_gold(t['price'])}G")
+    lines.append(f"Total: {fmt_gold(payout['total_before_deduction'])}G")
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
     lines.append(
-        f"🔖 Stamp Deduction  →  −{fmt_gold(stamp_deduction)}G  "
-        f"({total_stamps} stamps × {fmt_gold(stampprice)}G)"
+        f"🔖 Stamp Deduction  →  −{fmt_gold(payout['stamp_deduction'])}G  "
+        f"({payout['total_stamps']} stamps × {fmt_gold(raid['stampprice'])}G)"
     )
-    lines.append(f"💰 Net Pool         →  {fmt_gold(net_pool)}G")
-    lines.append(f"👥 Base Share       →  {fmt_gold(base_share)}G each")
+    lines.append(
+        f"💰 Net Pool         →  {fmt_gold(payout['net_pool'])}G "
+        f"({fmt_gold(payout['total_before_deduction'])}G - {fmt_gold(payout['stamp_deduction'])}G)"
+    )
+    lines.append(f"👥 Base Share       →  {fmt_gold(payout['base_share'])}G each")
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
     lines.append("📋 Payout")
     for pid in raid["player_ids"]:
-        bonus = bonus_by_player.get(pid, 0)
+        bonus = payout["bonus_by_player"].get(pid, 0)
         if bonus:
-            total = base_share + bonus
+            total = payout["base_share"] + bonus
             lines.append(
                 f"🏅 <@{pid}>  →  {fmt_gold(total)}G  (+{fmt_gold(bonus)}G stamp bonus)"
             )
         else:
-            lines.append(f"🏅 <@{pid}>  →  {fmt_gold(base_share)}G")
+            lines.append(f"🏅 <@{pid}>  →  {fmt_gold(payout['base_share'])}G")
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(
+        "Want your salary sent via in-game mail? Please send your IGN (In-Game "
+        "Name) in the Salary comment below. Make sure your IGN exactly matches "
+        "your character name, including capitalization and special characters."
+    )
+    lines.append("")
     lines.append(
         "Once you've received your share, run `/confirm` in this thread. "
         "When everyone has confirmed, this thread will close automatically."
     )
     return "\n".join(lines)
+
+
+def build_salary_dm_text(name: str, share: float) -> str:
+    return (
+        "# 💰 Your Raid Salary Is Ready!\n\n"
+        f"Hey **{name}**! 🎉  \n"
+        "Your salary from this run has been calculated and is ready to claim!\n\n"
+        f"> 👤 **Name:** {name}  \n"
+        f"> 💰 **Salary:** {fmt_gold(share)}G\n\n"
+        "## 📬 Request Your Salary\n\n"
+        "Want your salary sent via **in-game mail**?\n\n"
+        "Please send your **IGN (In-Game Name)** in the **Salary Thread** below.\n\n"
+        "> ⚠️ **Important:** Make sure your IGN **exactly matches your character "
+        "name**, including capitalization and special characters.\n\n"
+        "## ✅ Already Received Your Salary?\n\n"
+        "Please confirm by using **`/confirm`** in the Salary Thread.\n\n"
+        "Thanks for joining the run!  \n"
+        "**See you on the next raid! 🔥**\n\n"
+        "👇 **Claim / Request Your Salary**"
+    )
+
+
+async def send_salary_dms(client, raid: dict) -> list:
+    """DM every player their individual share with a link back to the raid
+    thread. Returns a list of player_ids that couldn't be reached."""
+    payout = compute_payout(raid)
+    thread_url = f"https://discord.com/channels/{raid['guild_id']}/{raid['thread_id']}"
+    failed = []
+    for pid in raid["player_ids"]:
+        name = raid["players"].get(pid, pid)
+        share = payout["base_share"] + payout["bonus_by_player"].get(pid, 0)
+        text = build_salary_dm_text(name, share)
+        view = discord.ui.View()
+        view.add_item(
+            discord.ui.Button(
+                label="Open Salary Thread",
+                url=thread_url,
+                style=discord.ButtonStyle.link,
+            )
+        )
+        try:
+            user = client.get_user(int(pid)) or await client.fetch_user(int(pid))
+            await user.send(content=text, view=view)
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            failed.append(pid)
+    return failed
 
 
 def build_stock_lines(raid: dict) -> list:
@@ -228,6 +303,25 @@ def build_stock_lines(raid: dict) -> list:
             f"- {g['item_name']} x{display_qty} | {stamper_str} | {status}{extra}"
         )
     return lines
+
+
+async def ack_and_announce(interaction: discord.Interaction, thread, content: str):
+    """Post the real result as a normal thread message (this has no
+    interaction-expiry risk at all), then best-effort acknowledge whatever
+    state the interaction is in -- deferred (use followup) or not yet
+    responded (use response.send_message directly). Any failure here is
+    silently swallowed since the important content is already posted."""
+    try:
+        await thread.send(content)
+    except discord.HTTPException:
+        pass
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("✅ Done.", ephemeral=True)
+        else:
+            await interaction.response.send_message("✅ Done.", ephemeral=True)
+    except discord.HTTPException:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -398,22 +492,27 @@ async def drop_cmd(
     stamp_qty: int = 0,
     stamper: discord.Member = None,
 ):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.HTTPException:
+        pass
+
     thread = interaction.channel
     if not isinstance(thread, discord.Thread):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "This command must be used inside a raid thread.", ephemeral=True
         )
         return
 
     raid = load_raid(thread.id)
     if not raid:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ No raid found in this thread. Run `/raid new` first.", ephemeral=True
         )
         return
 
     if raid["status"] != "in_progress":
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ This raid's loot has already been calculated/closed — no more drops can "
             "be added.",
             ephemeral=True,
@@ -422,19 +521,19 @@ async def drop_cmd(
 
     item_name_clean = item_name.strip()
     if not item_name_clean:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ Item name cannot be empty.", ephemeral=True
         )
         return
 
     if stamp_qty < 0:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ Stamp qty cannot be negative.", ephemeral=True
         )
         return
 
     if stamp_qty > 0 and stamper is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ A stamper must be selected when `stamp_qty` is greater than 0.",
             ephemeral=True,
         )
@@ -444,7 +543,7 @@ async def drop_cmd(
         stamper = None
 
     if stamper is not None and str(stamper.id) not in raid["player_ids"]:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"❌ {stamper.display_name} isn't part of this raid's player list.",
             ephemeral=True,
         )
@@ -488,7 +587,7 @@ async def drop_cmd(
         f"stampers: {stamper_mention}\n\n"
         f"**Remaining Stock:**\n{remaining_str}"
     )
-    await interaction.response.send_message(msg)
+    await ack_and_announce(interaction, thread, msg)
 
 
 # --------------------------------------------------------------------------
@@ -499,22 +598,27 @@ async def drop_cmd(
 @bot.tree.command(name="gold", description="Set the raid's additional gold (overwrites the previous value)")
 @app_commands.describe(amount="Total additional gold for this raid")
 async def gold_cmd(interaction: discord.Interaction, amount: float):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.HTTPException:
+        pass
+
     thread = interaction.channel
     if not isinstance(thread, discord.Thread):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "This command must be used inside a raid thread.", ephemeral=True
         )
         return
 
     raid = load_raid(thread.id)
     if not raid:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ No raid found in this thread. Run `/raid new` first.", ephemeral=True
         )
         return
 
     if raid["status"] != "in_progress":
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ This raid's loot has already been calculated/closed — gold can no longer "
             "be changed.",
             ephemeral=True,
@@ -522,15 +626,15 @@ async def gold_cmd(interaction: discord.Interaction, amount: float):
         return
 
     if amount < 0:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ Gold cannot be negative.", ephemeral=True
         )
         return
 
     raid["gold"] = amount
     save_raid(raid)
-    await interaction.response.send_message(
-        f"**Raid Gold recorded successfully!**\n\nGold: {fmt_gold(amount)}G"
+    await ack_and_announce(
+        interaction, thread, f"**Raid Gold recorded successfully!**\n\nGold: {fmt_gold(amount)}G"
     )
 
 
@@ -561,13 +665,18 @@ class SellDetailsModal(discord.ui.Modal, title="Sell Item"):
         self.add_item(self.price_input)
 
     async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.HTTPException:
+            pass
+
         raw_qty = str(self.qty_input.value).strip()
         raw_price = str(self.price_input.value).strip()
 
         try:
             qty_sold = int(raw_qty)
         except ValueError:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ `{raw_qty}` isn't a valid whole number for quantity sold.",
                 ephemeral=True,
             )
@@ -576,28 +685,28 @@ class SellDetailsModal(discord.ui.Modal, title="Sell Item"):
         try:
             price = float(raw_price)
         except ValueError:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ `{raw_price}` isn't a valid number for the sold price.",
                 ephemeral=True,
             )
             return
 
         if price < 0:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Price cannot be negative.", ephemeral=True
             )
             return
 
         thread = interaction.channel
         if not isinstance(thread, discord.Thread):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "This command must be used inside a raid thread.", ephemeral=True
             )
             return
 
         raid = load_raid(thread.id)
         if not raid:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ No raid found in this thread (it may have been cancelled).",
                 ephemeral=True,
             )
@@ -605,20 +714,20 @@ class SellDetailsModal(discord.ui.Modal, title="Sell Item"):
 
         entry = next((g for g in raid["drops"] if g["id"] == self.group_id), None)
         if not entry:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ That stock line no longer exists.", ephemeral=True
             )
             return
 
         remaining = group_remaining(entry)
         if remaining == 0:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ `{entry['item_name']}` is already fully sold.", ephemeral=True
             )
             return
 
         if qty_sold < 1 or qty_sold > remaining:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ Quantity sold must be between 1 and {remaining} "
                 f"(the current remaining amount for `{entry['item_name']}`).",
                 ephemeral=True,
@@ -656,7 +765,7 @@ class SellDetailsModal(discord.ui.Modal, title="Sell Item"):
             f"(now {new_status})\n\n"
             f"**remaining stock:**\n{stock_str}"
         )
-        await interaction.response.send_message(msg)
+        await ack_and_announce(interaction, thread, msg)
 
         if all_fully_sold(raid):
             raid["completed_at_ts"] = now_ts()
@@ -665,6 +774,15 @@ class SellDetailsModal(discord.ui.Modal, title="Sell Item"):
             raid["confirmed"] = []
             save_raid(raid)
             await thread.send(result_text)
+
+            failed_dms = await send_salary_dms(interaction.client, raid)
+            if failed_dms:
+                mentions = " ".join(f"<@{pid}>" for pid in failed_dms)
+                await thread.send(
+                    "⚠️ Couldn't DM the following players their salary summary "
+                    f"(they may have DMs disabled) — please notify them manually: "
+                    f"{mentions}"
+                )
 
 
 class ItemSelect(discord.ui.Select):
@@ -760,16 +878,21 @@ async def sell_cmd(interaction: discord.Interaction):
 
 @bot.tree.command(name="stock", description="Show the current raid stock and gold")
 async def stock_cmd(interaction: discord.Interaction):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.HTTPException:
+        pass
+
     thread = interaction.channel
     if not isinstance(thread, discord.Thread):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "This command must be used inside a raid thread.", ephemeral=True
         )
         return
 
     raid = load_raid(thread.id)
     if not raid:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "❌ No raid found in this thread. Run `/raid new` first.", ephemeral=True
         )
         return
@@ -782,7 +905,7 @@ async def stock_cmd(interaction: discord.Interaction):
         lines.append("_No items dropped yet._")
     lines.append("")
     lines.append(f"**Raid Gold:** {fmt_gold(raid['gold'])}G")
-    await interaction.response.send_message("\n".join(lines))
+    await ack_and_announce(interaction, thread, "\n".join(lines))
 
 
 # --------------------------------------------------------------------------
@@ -818,22 +941,27 @@ async def finalize_if_all_confirmed(raid: dict, thread: discord.Thread) -> bool:
 
 @bot.tree.command(name="confirm", description="Confirm you've received your share for this raid")
 async def confirm(interaction: discord.Interaction):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.HTTPException:
+        pass
+
     thread = interaction.channel
     if not isinstance(thread, discord.Thread):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "This command must be used inside a raid thread.", ephemeral=True
         )
         return
 
     raid = load_raid(thread.id)
     if not raid:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No raid data found for this thread.", ephemeral=True
         )
         return
 
     if raid["status"] == "in_progress":
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "The loot for this raid hasn't been calculated yet — wait until all items "
             "are marked sold first.",
             ephemeral=True,
@@ -842,7 +970,7 @@ async def confirm(interaction: discord.Interaction):
 
     uid = str(interaction.user.id)
     if uid not in raid["player_ids"]:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "You're not on the player roster for this raid, so this doesn't count as a "
             "confirmation.",
             ephemeral=True,
@@ -850,14 +978,14 @@ async def confirm(interaction: discord.Interaction):
         return
 
     if raid["status"] == "closed":
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "This raid is already fully confirmed and closed.", ephemeral=True
         )
         return
 
     confirmed = raid.setdefault("confirmed", [])
     if uid in confirmed:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "You've already confirmed for this raid.", ephemeral=True
         )
         return
@@ -867,9 +995,7 @@ async def confirm(interaction: discord.Interaction):
 
     total = len(raid["player_ids"])
     count = len(confirmed)
-    await interaction.response.send_message(
-        f"✅ <@{uid}> confirmed receipt. ({count}/{total})"
-    )
+    await ack_and_announce(interaction, thread, f"✅ <@{uid}> confirmed receipt. ({count}/{total})")
 
     await finalize_if_all_confirmed(raid, thread)
 
@@ -880,16 +1006,21 @@ async def confirm(interaction: discord.Interaction):
 )
 @app_commands.describe(player="The player to mark as confirmed")
 async def raid_forceconfirm(interaction: discord.Interaction, player: discord.Member):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.HTTPException:
+        pass
+
     thread = interaction.channel
     if not isinstance(thread, discord.Thread):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "This command must be used inside a raid thread.", ephemeral=True
         )
         return
 
     raid = load_raid(thread.id)
     if not raid:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No raid data found for this thread.", ephemeral=True
         )
         return
@@ -900,34 +1031,34 @@ async def raid_forceconfirm(interaction: discord.Interaction, player: discord.Me
         and interaction.user.guild_permissions.administrator
     )
     if not (is_creator or is_admin):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Only the raid creator or a server admin can force-confirm a player.",
             ephemeral=True,
         )
         return
 
     if raid["status"] == "in_progress":
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "The loot for this raid hasn't been calculated yet.", ephemeral=True
         )
         return
 
     uid = str(player.id)
     if uid not in raid["player_ids"]:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"{player.display_name} isn't on this raid's player roster.", ephemeral=True
         )
         return
 
     if raid["status"] == "closed":
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "This raid is already fully confirmed and closed.", ephemeral=True
         )
         return
 
     confirmed = raid.setdefault("confirmed", [])
     if uid in confirmed:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"{player.display_name} has already confirmed.", ephemeral=True
         )
         return
@@ -937,9 +1068,11 @@ async def raid_forceconfirm(interaction: discord.Interaction, player: discord.Me
 
     total = len(raid["player_ids"])
     count = len(confirmed)
-    await interaction.response.send_message(
+    await ack_and_announce(
+        interaction,
+        thread,
         f"✅ <@{uid}> marked as confirmed by {interaction.user.mention} (manual override). "
-        f"({count}/{total})"
+        f"({count}/{total})",
     )
 
     await finalize_if_all_confirmed(raid, thread)
@@ -982,15 +1115,20 @@ async def raid_status(interaction: discord.Interaction):
 
 @raid_group.command(name="cancel", description="Cancel/delete this raid (creator or admin only)")
 async def raid_cancel(interaction: discord.Interaction):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.HTTPException:
+        pass
+
     thread = interaction.channel
     if not isinstance(thread, discord.Thread):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "This command must be used inside a raid thread.", ephemeral=True
         )
         return
     raid = load_raid(thread.id)
     if not raid:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No raid data found for this thread.", ephemeral=True
         )
         return
@@ -1001,13 +1139,13 @@ async def raid_cancel(interaction: discord.Interaction):
         and interaction.user.guild_permissions.administrator
     )
     if not (is_creator or is_admin):
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Only the raid creator or a server admin can cancel this raid.", ephemeral=True
         )
         return
 
     delete_raid(thread.id)
-    await interaction.response.send_message("🗑️ Raid data cancelled/deleted for this thread.")
+    await ack_and_announce(interaction, thread, "🗑️ Raid data cancelled/deleted for this thread.")
 
 
 bot.tree.add_command(raid_group)

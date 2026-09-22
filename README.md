@@ -182,7 +182,16 @@ stock list in the thread.
 
 **Once every unit across every dropped stack has been sold**, the bot
 automatically calculates the full payout and posts it — no extra command
-needed. (There's currently no manual "force calculate" — if a raid has
+needed. The result now also shows a running **Total** (gold + everything
+sold, before stamp deduction) and spells out the Net Pool math as
+`(Total - Stamp Deduction)` so the arithmetic is easy to double-check.
+
+Right after posting the result in the thread, the bot also **DMs every
+player individually** with their own share amount and a link button back
+to the thread, so nobody has to scroll the thread to find their number.
+If a player has DMs disabled (or has blocked the bot), the bot can't
+reach them — it'll post a note in the thread listing who to notify
+manually. (There's currently no manual "force calculate" — if a raid has
 nothing to sell at all, just don't run `/raid new`/`/drop` for it; this
 bot is meant for raids that do have sellable loot.)
 
@@ -252,6 +261,18 @@ server admin can do this). Useful for starting over after a mistake.
 - Timestamps (loot calculated, raid closed) use Discord's dynamic
   timestamp format, so every player automatically sees them converted to
   their own local time zone.
+- Salary DMs depend on each player's own Discord privacy settings ("Allow
+  direct messages from server members"), not a bot permission — there's
+  nothing to configure on the bot's side for this to work, but a player
+  who has that setting off (or has blocked the bot) simply can't be
+  reached, and will be called out in the thread instead.
+- Every command acknowledges Discord's interaction immediately (before
+  doing any work), then posts its real result as a normal thread message.
+  Discord interactions expire ~3 seconds after being created if not
+  acknowledged right away, which can occasionally cause a "Something went
+  wrong" popup under network delay — acknowledging first, before any
+  processing, avoids that regardless of how long the actual work takes
+  afterward.
 - If you ever need to reset everything, stop the bot and delete the
   `data/raids/` folder — this wipes all raid history.
 - **Upgrade note:** this version changed how drops are stored internally
