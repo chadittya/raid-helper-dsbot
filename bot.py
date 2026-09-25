@@ -100,6 +100,30 @@ def now_ts() -> int:
     return int(datetime.datetime.now(datetime.timezone.utc).timestamp())
 
 
+def compute_match_key(item_name: str, stamper_id) -> str:
+    """Same matching algorithm /drop uses to group units into a stack.
+    Shared here so /dropedit can recompute it consistently when the item
+    name or stamper changes."""
+    return f"{item_name.strip().lower()}|{stamper_id or 'none'}"
+
+
+def drop_is_editable(drop: dict) -> bool:
+    """A drop is editable (for /dropedit V1) only if none of its units
+    have been sold yet."""
+    return all(not u["sold"] for u in drop["units"])
+
+
+def stamp_display_for(drop: dict) -> str:
+    total_units = group_total_units(drop)
+    if total_units == 1:
+        return str(drop["units"][0]["stamp_qty"])
+    return f"{group_total_stamp_qty(drop)} (across {total_units} units)"
+
+
+def stamper_display_for(drop: dict) -> str:
+    return f"<@{drop['stamper_id']}>" if drop["stamper_id"] else "None"
+
+
 def group_remaining(group: dict) -> int:
     return sum(1 for u in group["units"] if not u["sold"])
 
@@ -554,7 +578,7 @@ async def drop_cmd(
         return
 
     stamper_id = str(stamper.id) if stamper else None
-    match_key = f"{item_name_clean.lower()}|{stamper_id or 'none'}"
+    match_key = compute_match_key(item_name_clean, stamper_id)
 
     # Merge into an existing ACTIVE (not fully sold) group with the same
     # item name + stamper. If the only matching group is fully sold, start
@@ -639,6 +663,602 @@ async def gold_cmd(interaction: discord.Interaction, amount: float):
     save_raid(raid)
     await ack_and_announce(
         interaction, thread, f"**Raid Gold recorded successfully!**\n\nGold: {fmt_gold(amount)}G"
+    )
+
+
+# --------------------------------------------------------------------------
+# /dropedit  (select drop -> edit menu -> modal/select -> confirm -> save)
+# --------------------------------------------------------------------------
+
+CANNOT_EDIT_SOLD_MSG = "❌ This drop is no longer editable because it has been sold."
+DROP_GONE_MSG = "❌ Selected drop no longer exists."
+RAID_GONE_MSG = "❌ This raid no longer exists."
+DUPLICATE_MATCH_MSG = (
+    "❌ Cannot update this drop.\n\n"
+    "A drop with the same item and stamper already exists in this raid."
+)
+MULTI_UNIT_STAMP_MSG = (
+    "❌ Stamp quantity cannot be edited for this drop.\n\n"
+    "This drop contains multiple units. This will be supported in a future version."
+)
+
+
+def has_active_match_key_conflict(raid: dict, exclude_drop_id: str, match_key: str) -> bool:
+    """True if another ACTIVE (not fully sold) drop in this raid already
+    has this match_key. Mirrors /drop's own merge rule: a match_key that
+    only belongs to an already-fully-sold drop is not a conflict, since
+    /drop itself starts a fresh entry once an old one sells out."""
+    return any(
+        g["id"] != exclude_drop_id and g["match_key"] == match_key and group_remaining(g) > 0
+        for g in raid["drops"]
+    )
+
+
+async def safe_edit_origin(origin_interaction: discord.Interaction, fallback_interaction: discord.Interaction, content: str, view=None):
+    """Ephemeral interaction-response messages are not real channel
+    messages, so Message.edit() can't touch them (404 Unknown Message).
+    To edit one, you must use edit_original_response() on the SAME
+    interaction whose response produced it. If that fails (e.g. an
+    expired 15-minute token), fall back to a brand new ephemeral followup
+    on fallback_interaction so the flow doesn't just silently vanish."""
+    try:
+        await origin_interaction.edit_original_response(content=content, view=view)
+    except discord.HTTPException:
+        try:
+            followup_kwargs = {"content": content, "ephemeral": True}
+            if view is not None:
+                followup_kwargs["view"] = view
+            await fallback_interaction.followup.send(**followup_kwargs)
+        except discord.HTTPException:
+            pass
+
+
+class ConfirmEditView(discord.ui.View):
+    """Final Cancel/Confirm step shared by all three edit fields. `pending`
+    carries everything needed to re-validate and apply the change:
+    {thread_id, drop_id, field, new_value}."""
+
+    def __init__(self, requester_id: int, pending: dict):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.pending = pending
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran `/dropedit` can use this menu.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="❌ Edit cancelled. No changes were made.", view=None
+        )
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        thread_id = self.pending["thread_id"]
+        drop_id = self.pending["drop_id"]
+        field = self.pending["field"]
+
+        # Re-fetch fresh and re-validate everything before touching data --
+        # concurrency protection in case something changed since this
+        # confirmation screen was shown.
+        raid = load_raid(thread_id)
+        if not raid:
+            await interaction.response.edit_message(content=RAID_GONE_MSG, view=None)
+            return
+        drop = next((g for g in raid["drops"] if g["id"] == drop_id), None)
+        if not drop:
+            await interaction.response.edit_message(content=DROP_GONE_MSG, view=None)
+            return
+        if not drop_is_editable(drop):
+            await interaction.response.edit_message(content=CANNOT_EDIT_SOLD_MSG, view=None)
+            return
+
+        if field == "item_name":
+            new_name = self.pending["new_value"]
+            new_key = compute_match_key(new_name, drop["stamper_id"])
+            if has_active_match_key_conflict(raid, drop_id, new_key):
+                await interaction.response.edit_message(content=DUPLICATE_MATCH_MSG, view=None)
+                return
+            old_name = drop["item_name"]
+            drop["item_name"] = new_name
+            drop["match_key"] = new_key
+            success = (
+                "✅ Drop updated successfully.\n\n"
+                f"{old_name}\n→ {new_name}\n\n"
+                f"Stamp: {stamp_display_for(drop)}\n"
+                f"Stamper: {stamper_display_for(drop)}"
+            )
+
+        elif field == "stamp_qty":
+            if len(drop["units"]) != 1:
+                await interaction.response.edit_message(content=MULTI_UNIT_STAMP_MSG, view=None)
+                return
+            old_qty = drop["units"][0]["stamp_qty"]
+            new_qty = self.pending["new_value"]
+            drop["units"][0]["stamp_qty"] = new_qty
+            success = (
+                "✅ Drop updated successfully.\n\n"
+                f"{drop['item_name']}\n\n"
+                f"Stamp:\n{old_qty} → {new_qty}"
+            )
+
+        elif field == "stamper":
+            new_stamper_id = self.pending["new_value"]
+            if new_stamper_id not in raid["player_ids"]:
+                await interaction.response.edit_message(
+                    content="❌ That player isn't part of this raid.", view=None
+                )
+                return
+            new_key = compute_match_key(drop["item_name"], new_stamper_id)
+            if has_active_match_key_conflict(raid, drop_id, new_key):
+                await interaction.response.edit_message(content=DUPLICATE_MATCH_MSG, view=None)
+                return
+            old_display = stamper_display_for(drop)
+            drop["stamper_id"] = new_stamper_id
+            drop["match_key"] = new_key
+            success = (
+                "✅ Drop updated successfully.\n\n"
+                f"{drop['item_name']}\n\n"
+                f"Stamper:\n{old_display} → <@{new_stamper_id}>"
+            )
+        else:
+            await interaction.response.edit_message(content="❌ Unknown edit type.", view=None)
+            return
+
+        try:
+            save_raid(raid)
+        except Exception:
+            await interaction.response.edit_message(
+                content="❌ Failed to save changes. Please try again.", view=None
+            )
+            return
+
+        await interaction.response.edit_message(content=success, view=None)
+
+
+async def finish_modal_edit(modal_interaction: discord.Interaction, origin_interaction: discord.Interaction, content: str, view=None):
+    """Update the original edit-flow screen (via safe_edit_origin), then
+    always close out the modal's own deferred interaction with a small
+    ack so it never gets stuck showing 'thinking...'."""
+    await safe_edit_origin(origin_interaction, modal_interaction, content, view)
+    try:
+        await modal_interaction.followup.send("✅ Done.", ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+class ItemNameEditModal(discord.ui.Modal, title="Edit Item Name"):
+    def __init__(self, requester_id: int, thread_id: int, drop_id: str, current_name: str, origin_interaction: discord.Interaction):
+        super().__init__()
+        self.requester_id = requester_id
+        self.thread_id = thread_id
+        self.drop_id = drop_id
+        self.origin_interaction = origin_interaction
+        self.name_input = discord.ui.TextInput(
+            label="New item name",
+            style=discord.TextStyle.short,
+            default=current_name,
+            required=True,
+            max_length=100,
+        )
+        self.add_item(self.name_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+        new_name = str(self.name_input.value).strip()
+        if not new_name:
+            await interaction.followup.send("❌ Item name cannot be empty.", ephemeral=True)
+            return
+
+        raid = load_raid(self.thread_id)
+        if not raid:
+            await finish_modal_edit(interaction, self.origin_interaction, RAID_GONE_MSG, None)
+            return
+
+        drop = next((g for g in raid["drops"] if g["id"] == self.drop_id), None)
+        if not drop:
+            await finish_modal_edit(interaction, self.origin_interaction, DROP_GONE_MSG, None)
+            return
+
+        if not drop_is_editable(drop):
+            await finish_modal_edit(interaction, self.origin_interaction, CANNOT_EDIT_SOLD_MSG, None)
+            return
+
+        new_key = compute_match_key(new_name, drop["stamper_id"])
+        if has_active_match_key_conflict(raid, self.drop_id, new_key):
+            await finish_modal_edit(interaction, self.origin_interaction, DUPLICATE_MATCH_MSG, None)
+            return
+
+        content = (
+            "⚠️ **Confirm Change**\n\n"
+            f"Item Name:\n{drop['item_name']}\n→ {new_name}\n\n"
+            f"Stamp:\n{stamp_display_for(drop)}\n\n"
+            f"Stamper:\n{stamper_display_for(drop)}"
+        )
+        pending = {
+            "thread_id": self.thread_id,
+            "drop_id": self.drop_id,
+            "field": "item_name",
+            "new_value": new_name,
+        }
+        confirm_view = ConfirmEditView(requester_id=self.requester_id, pending=pending)
+        await finish_modal_edit(interaction, self.origin_interaction, content, confirm_view)
+
+
+class StampQtyEditModal(discord.ui.Modal, title="Edit Stamp Quantity"):
+    def __init__(self, requester_id: int, thread_id: int, drop_id: str, current_qty: int, origin_interaction: discord.Interaction):
+        super().__init__()
+        self.requester_id = requester_id
+        self.thread_id = thread_id
+        self.drop_id = drop_id
+        self.origin_interaction = origin_interaction
+        self.qty_input = discord.ui.TextInput(
+            label="New stamp quantity",
+            style=discord.TextStyle.short,
+            default=str(current_qty),
+            required=True,
+            max_length=10,
+        )
+        self.add_item(self.qty_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+        raw = str(self.qty_input.value).strip()
+        try:
+            new_qty = int(raw)
+        except ValueError:
+            await interaction.followup.send(
+                f"❌ `{raw}` isn't a valid whole number for stamp quantity.", ephemeral=True
+            )
+            return
+
+        if new_qty <= 0:
+            await interaction.followup.send(
+                "❌ Stamp quantity must be greater than 0.", ephemeral=True
+            )
+            return
+
+        raid = load_raid(self.thread_id)
+        if not raid:
+            await finish_modal_edit(interaction, self.origin_interaction, RAID_GONE_MSG, None)
+            return
+
+        drop = next((g for g in raid["drops"] if g["id"] == self.drop_id), None)
+        if not drop:
+            await finish_modal_edit(interaction, self.origin_interaction, DROP_GONE_MSG, None)
+            return
+
+        if not drop_is_editable(drop):
+            await finish_modal_edit(interaction, self.origin_interaction, CANNOT_EDIT_SOLD_MSG, None)
+            return
+
+        if len(drop["units"]) != 1:
+            await finish_modal_edit(interaction, self.origin_interaction, MULTI_UNIT_STAMP_MSG, None)
+            return
+
+        old_qty = drop["units"][0]["stamp_qty"]
+        content = (
+            "⚠️ **Confirm Change**\n\n"
+            f"{drop['item_name']}\n\n"
+            f"Stamp:\n{old_qty} → {new_qty}\n\n"
+            f"Stamper:\n{stamper_display_for(drop)}"
+        )
+        pending = {
+            "thread_id": self.thread_id,
+            "drop_id": self.drop_id,
+            "field": "stamp_qty",
+            "new_value": new_qty,
+        }
+        confirm_view = ConfirmEditView(requester_id=self.requester_id, pending=pending)
+        await finish_modal_edit(interaction, self.origin_interaction, content, confirm_view)
+
+
+class StamperSelect(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(placeholder="Choose new stamper...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: StamperSelectView = self.view
+        thread_id = view.thread_id
+        drop_id = view.drop_id
+        new_stamper_id = self.values[0]
+
+        raid = load_raid(thread_id)
+        if not raid:
+            await interaction.response.edit_message(content=RAID_GONE_MSG, view=None)
+            return
+        drop = next((g for g in raid["drops"] if g["id"] == drop_id), None)
+        if not drop:
+            await interaction.response.edit_message(content=DROP_GONE_MSG, view=None)
+            return
+        if not drop_is_editable(drop):
+            await interaction.response.edit_message(content=CANNOT_EDIT_SOLD_MSG, view=None)
+            return
+        if new_stamper_id not in raid["player_ids"]:
+            await interaction.response.edit_message(
+                content="❌ That player isn't part of this raid.", view=None
+            )
+            return
+
+        new_key = compute_match_key(drop["item_name"], new_stamper_id)
+        if has_active_match_key_conflict(raid, drop_id, new_key):
+            await interaction.response.edit_message(content=DUPLICATE_MATCH_MSG, view=None)
+            return
+
+        old_display = stamper_display_for(drop)
+        content = (
+            "⚠️ **Confirm Change**\n\n"
+            f"{drop['item_name']}\n\n"
+            f"Stamp:\n{stamp_display_for(drop)}\n\n"
+            f"Stamper:\n{old_display} → <@{new_stamper_id}>"
+        )
+        pending = {
+            "thread_id": thread_id,
+            "drop_id": drop_id,
+            "field": "stamper",
+            "new_value": new_stamper_id,
+        }
+        confirm_view = ConfirmEditView(requester_id=view.requester_id, pending=pending)
+        await interaction.response.edit_message(content=content, view=confirm_view)
+
+
+class StamperSelectView(discord.ui.View):
+    def __init__(self, requester_id: int, thread_id: int, drop_id: str, options):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.thread_id = thread_id
+        self.drop_id = drop_id
+        self.add_item(StamperSelect(options))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran `/dropedit` can use this menu.", ephemeral=True
+            )
+            return False
+        return True
+
+
+class EditMenuView(discord.ui.View):
+    def __init__(self, requester_id: int, thread_id: int, drop_id: str, origin_interaction: discord.Interaction):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.thread_id = thread_id
+        self.drop_id = drop_id
+        self.origin_interaction = origin_interaction
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran `/dropedit` can use this menu.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _load_current(self):
+        raid = load_raid(self.thread_id)
+        if not raid:
+            return None, None
+        drop = next((g for g in raid["drops"] if g["id"] == self.drop_id), None)
+        return raid, drop
+
+    @discord.ui.button(label="Item Name", emoji="📝", style=discord.ButtonStyle.primary)
+    async def edit_item_name(self, interaction: discord.Interaction, button: discord.ui.Button):
+        raid, drop = self._load_current()
+        if not raid or not drop:
+            await interaction.response.edit_message(content=DROP_GONE_MSG, view=None)
+            return
+        if not drop_is_editable(drop):
+            await interaction.response.edit_message(content=CANNOT_EDIT_SOLD_MSG, view=None)
+            return
+        modal = ItemNameEditModal(
+            requester_id=self.requester_id,
+            thread_id=self.thread_id,
+            drop_id=self.drop_id,
+            current_name=drop["item_name"],
+            origin_interaction=self.origin_interaction,
+        )
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Stamp Quantity", emoji="🔢", style=discord.ButtonStyle.primary)
+    async def edit_stamp_qty(self, interaction: discord.Interaction, button: discord.ui.Button):
+        raid, drop = self._load_current()
+        if not raid or not drop:
+            await interaction.response.edit_message(content=DROP_GONE_MSG, view=None)
+            return
+        if not drop_is_editable(drop):
+            await interaction.response.edit_message(content=CANNOT_EDIT_SOLD_MSG, view=None)
+            return
+        if len(drop["units"]) != 1:
+            await interaction.response.send_message(MULTI_UNIT_STAMP_MSG, ephemeral=True)
+            return
+        modal = StampQtyEditModal(
+            requester_id=self.requester_id,
+            thread_id=self.thread_id,
+            drop_id=self.drop_id,
+            current_qty=drop["units"][0]["stamp_qty"],
+            origin_interaction=self.origin_interaction,
+        )
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Stamper", emoji="👤", style=discord.ButtonStyle.primary)
+    async def edit_stamper(self, interaction: discord.Interaction, button: discord.ui.Button):
+        raid, drop = self._load_current()
+        if not raid or not drop:
+            await interaction.response.edit_message(content=DROP_GONE_MSG, view=None)
+            return
+        if not drop_is_editable(drop):
+            await interaction.response.edit_message(content=CANNOT_EDIT_SOLD_MSG, view=None)
+            return
+
+        options = []
+        for pid in raid["player_ids"][:25]:
+            name = raid["players"].get(pid, pid)
+            options.append(
+                discord.SelectOption(
+                    label=name[:100], value=pid, default=(pid == drop["stamper_id"])
+                )
+            )
+        if not options:
+            await interaction.response.send_message(
+                "❌ No participants found for this raid.", ephemeral=True
+            )
+            return
+
+        content = (
+            "👤 **Select Stamper**\n\n"
+            f"Current stamper:\n{stamper_display_for(drop)}\n\n"
+            "Select new stamper:"
+        )
+        stamper_view = StamperSelectView(
+            requester_id=self.requester_id,
+            thread_id=self.thread_id,
+            drop_id=self.drop_id,
+            options=options,
+        )
+        await interaction.response.edit_message(content=content, view=stamper_view)
+
+    @discord.ui.button(label="Cancel", emoji="❌", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="❌ Edit cancelled. No changes were made.", view=None
+        )
+
+
+class DropSelect(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(placeholder="Select drop to edit...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: DropEditSelectView = self.view
+        thread_id = view.thread_id
+        drop_id = self.values[0]
+
+        raid = load_raid(thread_id)
+        if not raid:
+            await interaction.response.edit_message(content=RAID_GONE_MSG, view=None)
+            return
+        drop = next((g for g in raid["drops"] if g["id"] == drop_id), None)
+        if not drop:
+            await interaction.response.edit_message(content=DROP_GONE_MSG, view=None)
+            return
+        if not drop_is_editable(drop):
+            await interaction.response.edit_message(content=CANNOT_EDIT_SOLD_MSG, view=None)
+            return
+
+        content = (
+            "✏️ **Edit Drop**\n\n"
+            f"Item:\n{drop['item_name']}\n\n"
+            f"Stamp:\n{stamp_display_for(drop)}\n\n"
+            f"Stamper:\n{stamper_display_for(drop)}\n\n"
+            "What would you like to edit?"
+        )
+        edit_view = EditMenuView(
+            requester_id=view.requester_id, thread_id=thread_id, drop_id=drop_id, origin_interaction=interaction
+        )
+        await interaction.response.edit_message(content=content, view=edit_view)
+
+
+class DropEditSelectView(discord.ui.View):
+    def __init__(self, requester_id: int, thread_id: int, options):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.thread_id = thread_id
+        self.add_item(DropSelect(options))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran `/dropedit` can use this menu.", ephemeral=True
+            )
+            return False
+        return True
+
+
+@bot.tree.command(
+    name="dropedit", description="Edit an existing unsold raid drop (item name, stamp qty, or stamper)"
+)
+async def dropedit_cmd(interaction: discord.Interaction):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+    thread = interaction.channel
+    if not isinstance(thread, discord.Thread):
+        await interaction.followup.send(
+            "This command must be used inside a raid thread.", ephemeral=True
+        )
+        return
+
+    raid = load_raid(thread.id)
+    if not raid:
+        await interaction.followup.send("❌ No active raid found.", ephemeral=True)
+        return
+
+    is_creator = interaction.user.id == raid["created_by"]
+    is_admin = (
+        isinstance(interaction.user, discord.Member)
+        and interaction.user.guild_permissions.administrator
+    )
+    if not (is_creator or is_admin):
+        await interaction.followup.send(
+            "Only the raid creator or a server admin can use `/dropedit`.", ephemeral=True
+        )
+        return
+
+    if raid["status"] != "in_progress":
+        await interaction.followup.send(
+            "🔒 This raid has already been finalized. Drops can no longer be edited.",
+            ephemeral=True,
+        )
+        return
+
+    if not raid["drops"]:
+        await interaction.followup.send("❌ There are no drops to edit.", ephemeral=True)
+        return
+
+    editable = [g for g in raid["drops"] if drop_is_editable(g)]
+    if not editable:
+        await interaction.followup.send(
+            "❌ There are no unsold drops available for editing.", ephemeral=True
+        )
+        return
+
+    note = ""
+    if len(editable) > 25:
+        note = "\n⚠️ More than 25 editable drops exist — only the first 25 are shown."
+        editable = editable[:25]
+
+    options = []
+    for idx, g in enumerate(editable, start=1):
+        label = f"D{idx:02d} • {g['item_name']}"[:100]
+        stamp_qty = group_total_stamp_qty(g)
+        if g["stamper_id"]:
+            stamper_name = raid["players"].get(g["stamper_id"], "?")
+            desc = f"{stamp_qty} stamp{'s' if stamp_qty != 1 else ''} • {stamper_name}"
+        else:
+            desc = "No stamp"
+        options.append(
+            discord.SelectOption(label=label, description=desc[:100], value=g["id"])
+        )
+
+    view = DropEditSelectView(requester_id=interaction.user.id, thread_id=thread.id, options=options)
+    await interaction.followup.send(
+        f"✏️ **Select Drop to Edit**{note}", view=view, ephemeral=True
     )
 
 

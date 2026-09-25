@@ -147,7 +147,45 @@ Run once per item collected:
 - Each successful `/drop` posts a confirmation with that drop's own stamp
   cost, plus the full current remaining (unsold) stock list.
 
-### 4. Record extra gold — `/gold`
+### 4. Fix a mistake — `/dropedit`
+
+**Raid creator or a server admin only.** Corrects an existing unsold drop
+without needing to cancel and restart the whole raid.
+
+```
+/dropedit
+```
+
+This opens a private, step-by-step flow:
+
+1. **Select a drop** from a dropdown of all currently unsold drops (e.g.
+   `D01 • Dragon Scale — 3 stamps • Nyan`). Drops that are already SOLD or
+   PARTIALLY SOLD don't appear here — V1 only allows editing drops that
+   haven't sold anything yet.
+2. **Pick what to change**: Item Name, Stamp Quantity, or Stamper (or
+   Cancel to back out with no changes).
+3. Depending on your choice:
+   - **Item Name** — a popup lets you type the corrected name.
+   - **Stamp Quantity** — a popup lets you type the corrected number.
+     Only available when the drop has exactly one unit (i.e. `/drop` was
+     only run once for that item+stamper combo) — if it has more, editing
+     is blocked for now since splitting the stamp count across multiple
+     units isn't supported yet.
+   - **Stamper** — a dropdown of the raid's actual participants (never
+     free text), so you can't accidentally assign it to someone outside
+     the raid.
+4. **Confirm the change** before anything is saved — you'll see exactly
+   what's changing, with a Cancel option right up until you click Confirm.
+
+A few safety rules apply automatically: changing the item name or stamper
+is rejected if it would collide with another still-unsold drop that
+already has that exact item+stamper combination (existing already-sold
+drops with the same combo don't block it, matching how `/drop` itself
+allows a fresh stack to start once an old one sells out); and if the drop
+gets sold by someone else while you're mid-edit, the change is rejected
+at the final confirmation step instead of silently applying.
+
+### 5. Record extra gold — `/gold`
 
 ```
 /gold amount:258
@@ -157,7 +195,7 @@ Sets the raid's flat gold amount. **Each call overwrites the previous
 value** — it does not add up, so if you need to correct it, just run it
 again with the right total.
 
-### 5. Sell an item — `/sell`
+### 6. Sell an item — `/sell`
 
 ```
 /sell
@@ -195,7 +233,7 @@ manually. (There's currently no manual "force calculate" — if a raid has
 nothing to sell at all, just don't run `/raid new`/`/drop` for it; this
 bot is meant for raids that do have sellable loot.)
 
-### 6. Check current stock — `/stock`
+### 7. Check current stock — `/stock`
 
 ```
 /stock
@@ -212,7 +250,7 @@ status. Status is one of:
 
 Plus the current raid gold total.
 
-### 7. Confirm you've been paid — `/confirm`
+### 8. Confirm you've been paid — `/confirm`
 
 Once the payout has been calculated and posted, each player runs
 `/confirm` in the thread to acknowledge they received their share:
@@ -228,7 +266,7 @@ Once the payout has been calculated and posted, each player runs
   later, which automatically reopens/unarchives it (e.g. for a late
   correction).
 
-### 8. Force-confirm a player — `/raid forceconfirm`
+### 9. Force-confirm a player — `/raid forceconfirm`
 
 Sometimes a player receives their share but never runs `/confirm`. The
 **raid creator or a server admin** can run
@@ -237,13 +275,13 @@ that player as confirmed on their behalf. This counts the same as a real
 `/confirm`, including triggering the automatic close if they were the
 last one needed.
 
-### 9. Check raid status — `/raid status`
+### 10. Check raid status — `/raid status`
 
 Shows the raid's current phase (`in_progress` / `completed` / `closed`),
 when it started, and — once loot is calculated — who has and hasn't
 confirmed yet.
 
-### 10. Cancel a raid — `/raid cancel`
+### 11. Cancel a raid — `/raid cancel`
 
 Deletes this thread's raid data entirely (only the raid creator or a
 server admin can do this). Useful for starting over after a mistake.
