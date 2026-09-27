@@ -26,6 +26,12 @@ Flow:
         status) and raid gold. AVAILABLE / PARTIALLY SOLD / SOLD.
   7. /confirm and /raid forceconfirm work as before: each player confirms
      receipt, and once everyone has confirmed the thread auto-archives.
+  8. /playeredit -> creator/admin only. Fixes a mistagged player on the
+     roster: pick the wrong player from a dropdown, then pick the correct
+     one via Discord's native member picker, then confirm. Blocked for a
+     given player once they're the stamper on an item that's already
+     sold (their stamp bonus is already locked into a completed sale),
+     and blocked entirely once the raid is no longer in_progress.
 
 Data is stored as one JSON file per thread under DATA_DIR, so raids
 survive a bot restart.
@@ -492,10 +498,12 @@ async def raid_new(interaction: discord.Interaction, stampprice: float):
     mentions_str = " ".join(f"<@{pid}>" for pid in player_ids)
     success_msg = (
         "**New Raid Created successfully!**\n\n"
-        "use `/drop` for listing current raid drop and stampers\n"
-        "use `/sell` for selling current drop\n"
-        "use `/gold` for list additional current raid gold\n"
-        "use `/stock` for checking current drop stock and the stock update\n\n"
+        "Next action:\n"
+        "- use /drop for listing current raid drop and stampers\n"
+        "- use /sell for selling current drop\n"
+        "- use /gold for list additional current raid gold\n"
+        "- use /stock for checking current drop stock and the stock update\n\n"
+        "if you need help use command `/help`\n\n"
         f"👥 Players detected: {mentions_str}\n"
         f"🔖 Stamp price: {fmt_gold(stampprice)}G/stamp"
     )
@@ -1263,6 +1271,365 @@ async def dropedit_cmd(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------------
+# /playeredit  (select player -> pick correct player (native member picker)
+#               -> confirm -> save)
+# --------------------------------------------------------------------------
+
+PLAYER_RAID_GONE_MSG = "❌ This raid no longer exists."
+PLAYER_GONE_MSG = "❌ Selected player is no longer on this raid's roster."
+PLAYER_NOT_EDITABLE_MSG = (
+    "❌ This player can no longer be edited — they're the stamper on an item that "
+    "has already sold, so their stamp bonus is already locked into a completed sale."
+)
+PLAYER_ALREADY_ON_ROSTER_MSG = "❌ That player is already on this raid's roster."
+PLAYER_NO_CHANGE_MSG = "That's already the selected player — no change made."
+PLAYER_BOT_MSG = "❌ A bot can't be added as a raid player."
+PLAYER_RAID_LOCKED_MSG = (
+    "🔒 This raid has already been finalized. The player roster can no longer be edited."
+)
+
+
+def player_has_sold_stamp_bond(raid: dict, player_id: str) -> bool:
+    """True if this player is the stamper on a drop that already has at
+    least one sold unit -- their stamp bonus for that sale is already
+    baked into a completed transaction, so swapping their identity out
+    from under it would silently corrupt payout math that may already
+    have been paid out/DMed."""
+    return any(
+        g["stamper_id"] == player_id and any(u["sold"] for u in g["units"])
+        for g in raid["drops"]
+    )
+
+
+def find_player_swap_conflict(raid: dict, old_id: str, new_id: str):
+    """If reassigning old_id's actively-stamped drops to new_id would
+    collide with an item new_id is already actively stamping under the
+    same name, return that item's name so the caller can reject the
+    swap. Otherwise return None. (Only ACTIVE/not-fully-sold drops can
+    collide, mirroring /drop and /dropedit's own merge rules.)"""
+    for g in raid["drops"]:
+        if g["stamper_id"] != old_id or group_remaining(g) == 0:
+            continue
+        new_key = compute_match_key(g["item_name"], new_id)
+        collides = any(
+            other["id"] != g["id"] and other["match_key"] == new_key and group_remaining(other) > 0
+            for other in raid["drops"]
+        )
+        if collides:
+            return g["item_name"]
+    return None
+
+
+def apply_player_swap(raid: dict, old_id: str, new_id: str, new_name: str):
+    """Mutates raid in place: swaps old_id -> new_id everywhere it
+    appears (roster, drop stamper references + their match_keys, and
+    confirmation list), preserving order and any prior confirmation."""
+    raid["player_ids"] = [new_id if pid == old_id else pid for pid in raid["player_ids"]]
+    raid["players"] = {
+        (new_id if pid == old_id else pid): (new_name if pid == old_id else name)
+        for pid, name in raid["players"].items()
+    }
+    for g in raid["drops"]:
+        if g["stamper_id"] == old_id:
+            g["stamper_id"] = new_id
+            g["match_key"] = compute_match_key(g["item_name"], new_id)
+    confirmed = raid.get("confirmed", [])
+    raid["confirmed"] = [new_id if pid == old_id else pid for pid in confirmed]
+
+
+class PlayerEditConfirmView(discord.ui.View):
+    """Final Cancel/Confirm step. `pending` carries everything needed to
+    re-validate and apply the swap: {thread_id, old_id, new_id, new_name}."""
+
+    def __init__(self, requester_id: int, pending: dict):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.pending = pending
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran `/playeredit` can use this menu.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            content="❌ Edit cancelled. No changes were made.", view=None
+        )
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        thread_id = self.pending["thread_id"]
+        old_id = self.pending["old_id"]
+        new_id = self.pending["new_id"]
+        new_name = self.pending["new_name"]
+
+        # Re-fetch fresh and re-validate everything before touching data --
+        # concurrency protection in case a sale went through, or the raid
+        # changed some other way, while this confirmation screen was open.
+        raid = load_raid(thread_id)
+        if not raid:
+            await interaction.response.edit_message(content=PLAYER_RAID_GONE_MSG, view=None)
+            return
+        if raid["status"] != "in_progress":
+            await interaction.response.edit_message(content=PLAYER_RAID_LOCKED_MSG, view=None)
+            return
+        if old_id not in raid["player_ids"]:
+            await interaction.response.edit_message(content=PLAYER_GONE_MSG, view=None)
+            return
+        if player_has_sold_stamp_bond(raid, old_id):
+            await interaction.response.edit_message(content=PLAYER_NOT_EDITABLE_MSG, view=None)
+            return
+        if new_id in raid["player_ids"]:
+            await interaction.response.edit_message(content=PLAYER_ALREADY_ON_ROSTER_MSG, view=None)
+            return
+        conflict_item = find_player_swap_conflict(raid, old_id, new_id)
+        if conflict_item:
+            await interaction.response.edit_message(
+                content=(
+                    "❌ Cannot update this player.\n\n"
+                    f"The new player already has another active stamped drop for "
+                    f"**{conflict_item}** — that would collide with it."
+                ),
+                view=None,
+            )
+            return
+
+        old_name = raid["players"].get(old_id, old_id)
+        apply_player_swap(raid, old_id, new_id, new_name)
+
+        try:
+            save_raid(raid)
+        except Exception:
+            await interaction.response.edit_message(
+                content="❌ Failed to save changes. Please try again.", view=None
+            )
+            return
+
+        # Public announcement so the rest of the raid sees the correction
+        # and the up-to-date roster, not just the person who ran the
+        # command. Best-effort: a failure here shouldn't undo the save or
+        # block the ephemeral success reply below.
+        roster_mentions = ", ".join(f"<@{pid}>" for pid in raid["player_ids"])
+        public_announcement = (
+            "🔧 **Player Roster Updated**\n"
+            f"{old_name} (<@{old_id}>) → {new_name} (<@{new_id}>)\n"
+            f"Updated by {interaction.user.mention}\n\n"
+            f"**Current players ({len(raid['player_ids'])}):** {roster_mentions}"
+        )
+        try:
+            await interaction.channel.send(public_announcement)
+        except discord.HTTPException:
+            pass
+
+        success = (
+            "✅ Player updated successfully. A public update was posted in the thread.\n\n"
+            f"{old_name} (<@{old_id}>)\n→ {new_name} (<@{new_id}>)"
+        )
+        await interaction.response.edit_message(content=success, view=None)
+
+
+class NewPlayerSelect(discord.ui.UserSelect):
+    """Discord's native member picker -- same kind of no-typing, roster-
+    safe input /drop uses for `stamper`, just for picking the corrected
+    player instead."""
+
+    def __init__(self):
+        super().__init__(placeholder="Select the correct player...", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: NewPlayerSelectView = self.view
+        thread_id = view.thread_id
+        old_id = view.old_id
+
+        new_member = self.values[0]
+        if new_member.bot:
+            await interaction.response.edit_message(content=PLAYER_BOT_MSG, view=None)
+            return
+        new_id = str(new_member.id)
+
+        raid = load_raid(thread_id)
+        if not raid:
+            await interaction.response.edit_message(content=PLAYER_RAID_GONE_MSG, view=None)
+            return
+        if raid["status"] != "in_progress":
+            await interaction.response.edit_message(content=PLAYER_RAID_LOCKED_MSG, view=None)
+            return
+        if old_id not in raid["player_ids"]:
+            await interaction.response.edit_message(content=PLAYER_GONE_MSG, view=None)
+            return
+        if player_has_sold_stamp_bond(raid, old_id):
+            await interaction.response.edit_message(content=PLAYER_NOT_EDITABLE_MSG, view=None)
+            return
+        if new_id == old_id:
+            await interaction.response.edit_message(content=PLAYER_NO_CHANGE_MSG, view=None)
+            return
+        if new_id in raid["player_ids"]:
+            await interaction.response.edit_message(content=PLAYER_ALREADY_ON_ROSTER_MSG, view=None)
+            return
+
+        conflict_item = find_player_swap_conflict(raid, old_id, new_id)
+        if conflict_item:
+            await interaction.response.edit_message(
+                content=(
+                    "❌ Cannot update this player.\n\n"
+                    f"The new player already has another active stamped drop for "
+                    f"**{conflict_item}** — that would collide with it."
+                ),
+                view=None,
+            )
+            return
+
+        old_name = raid["players"].get(old_id, old_id)
+        new_name = getattr(new_member, "display_name", None) or new_member.name
+
+        content = (
+            "⚠️ **Confirm Change**\n\n"
+            f"{old_name} (<@{old_id}>)\n→ {new_name} (<@{new_id}>)"
+        )
+        pending = {
+            "thread_id": thread_id,
+            "old_id": old_id,
+            "new_id": new_id,
+            "new_name": new_name,
+        }
+        confirm_view = PlayerEditConfirmView(requester_id=view.requester_id, pending=pending)
+        await interaction.response.edit_message(content=content, view=confirm_view)
+
+
+class NewPlayerSelectView(discord.ui.View):
+    def __init__(self, requester_id: int, thread_id: int, old_id: str):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.thread_id = thread_id
+        self.old_id = old_id
+        self.add_item(NewPlayerSelect())
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran `/playeredit` can use this menu.", ephemeral=True
+            )
+            return False
+        return True
+
+
+class PlayerSelect(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(placeholder="Select player to edit...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: PlayerEditSelectView = self.view
+        thread_id = view.thread_id
+        old_id = self.values[0]
+
+        raid = load_raid(thread_id)
+        if not raid:
+            await interaction.response.edit_message(content=PLAYER_RAID_GONE_MSG, view=None)
+            return
+        if raid["status"] != "in_progress":
+            await interaction.response.edit_message(content=PLAYER_RAID_LOCKED_MSG, view=None)
+            return
+        if old_id not in raid["player_ids"]:
+            await interaction.response.edit_message(content=PLAYER_GONE_MSG, view=None)
+            return
+        if player_has_sold_stamp_bond(raid, old_id):
+            await interaction.response.edit_message(content=PLAYER_NOT_EDITABLE_MSG, view=None)
+            return
+
+        old_name = raid["players"].get(old_id, old_id)
+        content = (
+            "👤 **Select Correct Player**\n\n"
+            f"Currently: {old_name} (<@{old_id}>)\n\n"
+            "Pick who this should actually be:"
+        )
+        new_view = NewPlayerSelectView(requester_id=view.requester_id, thread_id=thread_id, old_id=old_id)
+        await interaction.response.edit_message(content=content, view=new_view)
+
+
+class PlayerEditSelectView(discord.ui.View):
+    def __init__(self, requester_id: int, thread_id: int, options):
+        super().__init__(timeout=300)
+        self.requester_id = requester_id
+        self.thread_id = thread_id
+        self.add_item(PlayerSelect(options))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran `/playeredit` can use this menu.", ephemeral=True
+            )
+            return False
+        return True
+
+
+@bot.tree.command(
+    name="playeredit", description="Fix a mistagged player on the raid roster (creator/admin only)"
+)
+async def playeredit_cmd(interaction: discord.Interaction):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+    thread = interaction.channel
+    if not isinstance(thread, discord.Thread):
+        await interaction.followup.send(
+            "This command must be used inside a raid thread.", ephemeral=True
+        )
+        return
+
+    raid = load_raid(thread.id)
+    if not raid:
+        await interaction.followup.send("❌ No active raid found.", ephemeral=True)
+        return
+
+    is_creator = interaction.user.id == raid["created_by"]
+    is_admin = (
+        isinstance(interaction.user, discord.Member)
+        and interaction.user.guild_permissions.administrator
+    )
+    if not (is_creator or is_admin):
+        await interaction.followup.send(
+            "Only the raid creator or a server admin can use `/playeredit`.", ephemeral=True
+        )
+        return
+
+    if raid["status"] != "in_progress":
+        await interaction.followup.send(PLAYER_RAID_LOCKED_MSG, ephemeral=True)
+        return
+
+    editable_ids = [
+        pid for pid in raid["player_ids"] if not player_has_sold_stamp_bond(raid, pid)
+    ]
+    if not editable_ids:
+        await interaction.followup.send(
+            "❌ No players can be edited right now — everyone left on the roster is already "
+            "the stamper on an item that's sold.",
+            ephemeral=True,
+        )
+        return
+
+    note = ""
+    if len(editable_ids) > 25:
+        note = "\n⚠️ More than 25 editable players exist — only the first 25 are shown."
+        editable_ids = editable_ids[:25]
+
+    options = [
+        discord.SelectOption(label=raid["players"].get(pid, pid)[:100], value=pid)
+        for pid in editable_ids
+    ]
+
+    view = PlayerEditSelectView(requester_id=interaction.user.id, thread_id=thread.id, options=options)
+    await interaction.followup.send(
+        f"👤 **Select Player to Edit**{note}", view=view, ephemeral=True
+    )
+
+
+# --------------------------------------------------------------------------
 # /sell  (select menu -> modal with qty + price)
 # --------------------------------------------------------------------------
 
@@ -1773,6 +2140,120 @@ async def raid_cancel(interaction: discord.Interaction):
 
 
 bot.tree.add_command(raid_group)
+
+
+# --------------------------------------------------------------------------
+# /help  (lists every command with an elaboration; works anywhere)
+# --------------------------------------------------------------------------
+
+@bot.tree.command(name="help", description="List every raid command and what it does")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📖 Raid Loot Share Bot — Commands",
+        description=(
+            "Run these inside the raid's thread, unless noted otherwise. "
+            "🔒 = raid creator or a server admin only."
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="/raid new `stampprice`",
+        value=(
+            "Starts tracking a raid in this thread. Reads player mentions from the "
+            "thread's very first message to build the roster, and sets the "
+            "gold-per-stamp price for the whole raid (set once here)."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/drop `item_name` `stamp_qty` `stamper`",
+        value=(
+            "Records one dropped unit. Run once per item that drops — running it "
+            "again with the same item name + stamper merges into the same stack. "
+            "`stamper` is required only if `stamp_qty` is greater than 0."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔒 /dropedit",
+        value=(
+            "Fixes a mistake on an existing **unsold** drop — item name, stamp "
+            "quantity, or stamper — through a private step-by-step menu, without "
+            "cancelling the whole raid."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔒 /playeredit",
+        value=(
+            "Fixes a mistagged player on the roster: pick the wrong player, then "
+            "pick the correct one with a native member picker. Blocked for a "
+            "player once they're the stamper on an item that's already sold."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/gold `amount`",
+        value=(
+            "Sets the raid's flat extra gold. **Overwrites** the previous value "
+            "each time (not additive) — re-run it to correct a mistake."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/sell",
+        value=(
+            "Opens a private dropdown of stock that still has unsold units. Pick "
+            "one, then enter the quantity sold and total price for that sale "
+            "(supports partial sales). Once every unit is sold, the payout is "
+            "calculated and posted automatically, and DMed to every player."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/stock",
+        value=(
+            "Posts the full current stock list publicly: item, stamper, "
+            "remaining/sold quantities and status, plus the current raid gold."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/confirm",
+        value=(
+            "Run this once you've received your share, to acknowledge payment. "
+            "Once everyone on the roster has confirmed, the thread auto-archives."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔒 /raid forceconfirm `player`",
+        value=(
+            "Manually marks a non-responsive player as confirmed — same effect as "
+            "them running `/confirm` themselves, including triggering auto-close."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="/raid status",
+        value=(
+            "Shows the raid's current phase, when it started, and — once "
+            "completed — who has and hasn't confirmed yet."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🔒 /raid cancel",
+        value="Deletes this thread's raid data entirely, for starting over after a mistake.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/help",
+        value="Shows this list. Can be run anywhere, even outside a raid thread.",
+        inline=False,
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # --------------------------------------------------------------------------

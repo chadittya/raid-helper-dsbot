@@ -122,7 +122,8 @@ Inside that same thread, run:
   find any mentions, or the thread has no messages yet, it tells you
   exactly what's wrong so you can fix it and retry.
 - On success, the bot posts a confirmation in the thread listing the
-  detected players and stamp price, plus the commands you'll use next.
+  detected players and stamp price, plus the commands you'll use next
+  (and a reminder that `/help` lists everything if you need it).
 
 ### 3. Record loot — `/drop`
 
@@ -185,7 +186,44 @@ allows a fresh stack to start once an old one sells out); and if the drop
 gets sold by someone else while you're mid-edit, the change is rejected
 at the final confirmation step instead of silently applying.
 
-### 5. Record extra gold — `/gold`
+### 5. Fix a mistagged player — `/playeredit`
+
+**Raid creator or a server admin only.** Corrects a player who was
+mistagged (or picked wrong) when the raid was created, without needing to
+cancel and restart the whole raid.
+
+```
+/playeredit
+```
+
+This opens a private, step-by-step flow:
+
+1. **Select the player to fix** from a dropdown of the current roster.
+   Players who are already the stamper on an item that's been sold don't
+   appear here — their stamp bonus is already locked into a completed
+   sale, so they can no longer be swapped out.
+2. **Pick the correct player** using Discord's native member picker (the
+   same kind of picker `/drop` uses for `stamper` — no typing, no risk of
+   a typo).
+3. **Confirm the change** before anything is saved — you'll see the old
+   name and the new one side by side, with a Cancel option right up until
+   you click Confirm.
+
+The swap updates the roster everywhere it matters: the player list, any
+of their unsold stamped drops (so `/stock` and the final payout still
+credit the right person), and their confirmation status if they'd already
+run `/confirm`. Once confirmed, the bot also **posts publicly** in the
+thread — `old player → new player`, who made the change, and the full
+current roster — so everyone in the raid sees the correction, not just
+whoever ran the command.
+
+It's rejected if the new player is already on the roster, or if
+reassigning would collide with another active drop the new player is
+already stamping under the same item name. Like `/drop` and `/gold`,
+`/playeredit` stops working once the raid's loot has been calculated
+(status `completed` or `closed`).
+
+### 6. Record extra gold — `/gold`
 
 ```
 /gold amount:258
@@ -195,7 +233,7 @@ Sets the raid's flat gold amount. **Each call overwrites the previous
 value** — it does not add up, so if you need to correct it, just run it
 again with the right total.
 
-### 6. Sell an item — `/sell`
+### 7. Sell an item — `/sell`
 
 ```
 /sell
@@ -233,7 +271,7 @@ manually. (There's currently no manual "force calculate" — if a raid has
 nothing to sell at all, just don't run `/raid new`/`/drop` for it; this
 bot is meant for raids that do have sellable loot.)
 
-### 7. Check current stock — `/stock`
+### 8. Check current stock — `/stock`
 
 ```
 /stock
@@ -250,7 +288,7 @@ status. Status is one of:
 
 Plus the current raid gold total.
 
-### 8. Confirm you've been paid — `/confirm`
+### 9. Confirm you've been paid — `/confirm`
 
 Once the payout has been calculated and posted, each player runs
 `/confirm` in the thread to acknowledge they received their share:
@@ -266,7 +304,7 @@ Once the payout has been calculated and posted, each player runs
   later, which automatically reopens/unarchives it (e.g. for a late
   correction).
 
-### 9. Force-confirm a player — `/raid forceconfirm`
+### 10. Force-confirm a player — `/raid forceconfirm`
 
 Sometimes a player receives their share but never runs `/confirm`. The
 **raid creator or a server admin** can run
@@ -275,27 +313,44 @@ that player as confirmed on their behalf. This counts the same as a real
 `/confirm`, including triggering the automatic close if they were the
 last one needed.
 
-### 10. Check raid status — `/raid status`
+### 11. Check raid status — `/raid status`
 
 Shows the raid's current phase (`in_progress` / `completed` / `closed`),
 when it started, and — once loot is calculated — who has and hasn't
 confirmed yet.
 
-### 11. Cancel a raid — `/raid cancel`
+### 12. Cancel a raid — `/raid cancel`
 
 Deletes this thread's raid data entirely (only the raid creator or a
 server admin can do this). Useful for starting over after a mistake.
+
+### 13. List every command — `/help`
+
+```
+/help
+```
+
+Posts a private (ephemeral) list of every command the bot has, with a
+short explanation of what each one does and who's allowed to run it (🔒
+marks creator/admin-only commands). Unlike the other commands, `/help`
+isn't tied to a raid thread — it works anywhere the bot's slash commands
+are available.
 
 ---
 
 ## Notes & Limitations
 
-- Each thread holds exactly one raid. Every command (`/drop`, `/gold`,
-  `/sell`, `/stock`, `/confirm`, and the `/raid ...` subcommands) must be
-  run **inside** that raid's thread.
-- `/drop` and `/gold` stop working once the raid's loot has been
-  calculated (status `completed` or `closed`) — no changes after the
-  payout is posted.
+- Each thread holds exactly one raid. Every command (`/drop`, `/dropedit`,
+  `/playeredit`, `/gold`, `/sell`, `/stock`, `/confirm`, and the
+  `/raid ...` subcommands) must be run **inside** that raid's thread.
+  `/help` is the one exception — it works anywhere.
+- `/drop`, `/gold`, and `/playeredit` stop working once the raid's loot
+  has been calculated (status `completed` or `closed`) — no changes after
+  the payout is posted.
+- `/playeredit` additionally can't touch a specific player once they're
+  the stamper on an item that's already sold, even while the raid is
+  otherwise still `in_progress` — that stamp bonus is already part of a
+  completed sale.
 - Timestamps (loot calculated, raid closed) use Discord's dynamic
   timestamp format, so every player automatically sees them converted to
   their own local time zone.
