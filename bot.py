@@ -505,7 +505,8 @@ async def raid_new(interaction: discord.Interaction, stampprice: float):
         "- use `/stock` for checking current drop stock and the stock update\n\n"
         "if you need help use command `/help`\n\n"
         f"👥 Players detected: {mentions_str}\n"
-        f"🔖 Stamp price: {fmt_gold(stampprice)}G/stamp"
+        f"🔖 Stamp price: {fmt_gold(stampprice)}G/stamp\n\n"
+        f"⚠️ **Please check the player list above. If your name is missing or incorrectly tagged, please let an admin know.**"
     )
     await thread.send(success_msg)
     await interaction.followup.send("✅ Raid created.", ephemeral=True)
