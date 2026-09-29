@@ -240,7 +240,9 @@ def calculate_and_format(raid: dict) -> str:
         f"💰 Net Pool         →  {fmt_gold(payout['net_pool'])}G "
         f"({fmt_gold(payout['total_before_deduction'])}G - {fmt_gold(payout['stamp_deduction'])}G)"
     )
-    lines.append(f"👥 Base Share       →  {fmt_gold(payout['base_share'])}G each")
+    lines.append(f"👥 Base Share       →  {fmt_gold(payout['base_share'])}G each "
+        f"({fmt_gold(payout['net_pool'])}G ÷ {num_players} players)"
+    )
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
     lines.append("📋 Payout")
     for pid in raid["player_ids"]:
@@ -1755,7 +1757,7 @@ class SellDetailsModal(discord.ui.Modal, title="Sell Item"):
             "**One or more item is SOLD!**\n\n"
             f"{entry['item_name']} x{qty_sold} sold at {fmt_gold(price)}G "
             f"(now {new_status})\n\n"
-            f"**remaining stock:**\n{stock_str}"
+            f"**Remaining Stock:**\n{stock_str}"
         )
         await ack_and_announce(interaction, thread, msg)
 
