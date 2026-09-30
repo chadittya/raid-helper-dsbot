@@ -384,17 +384,13 @@ async def on_ready():
 raid_group = app_commands.Group(name="raid", description="Raid loot management")
 
 
-async def get_thread_intro_message(thread: discord.Thread):
-    """Find the message containing player mentions for this raid thread.
+async def get_thread_intro_candidates(thread: discord.Thread, limit: int = 10):
+    """Return candidate intro messages as (source, message) tuples, in priority
+    order: the starter message (right-click -> Create Thread) first, then the
+    earliest *real* user messages inside the thread. System messages (thread
+    starter references, 'X added Y', etc.) are skipped."""
+    candidates = []
 
-    Threads created via "right-click a message -> Create Thread" have a
-    special *starter message* that is NOT returned by thread.history() --
-    it has to be fetched from the parent channel using the thread's own ID
-    (Discord assigns the starter message the same ID as the thread).
-    Threads created via the plain "+ Threads -> Create" flow have no
-    starter message at all, so we fall back to the first message actually
-    sent inside the thread.
-    """
     starter = thread.starter_message
     if starter is None and thread.parent is not None and hasattr(thread.parent, "fetch_message"):
         try:
@@ -402,11 +398,16 @@ async def get_thread_intro_message(thread: discord.Thread):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             starter = None
     if starter is not None:
-        return starter
+        candidates.append(("starter", starter))
 
-    async for m in thread.history(limit=1, oldest_first=True):
-        return m
-    return None
+    async for m in thread.history(limit=limit, oldest_first=True):
+        if m.type not in (discord.MessageType.default, discord.MessageType.reply):
+            continue
+        if any(m.id == c.id for _, c in candidates):
+            continue
+        candidates.append(("history", m))
+
+    return candidates
 
 
 @raid_group.command(
@@ -440,9 +441,8 @@ async def raid_new(interaction: discord.Interaction, stampprice: float):
         return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
-
     try:
-        first_msg = await get_thread_intro_message(thread)
+        candidates = await get_thread_intro_candidates(thread)
     except discord.Forbidden:
         await interaction.followup.send(
             "❌ I don't have permission to read this thread's message history "
@@ -451,7 +451,7 @@ async def raid_new(interaction: discord.Interaction, stampprice: float):
         )
         return
 
-    if first_msg is None:
+    if not candidates:
         await interaction.followup.send(
             "❌ This thread doesn't have any messages yet. Post a message mentioning "
             "every raid participant first (e.g. `@Player1 @Player2 ...`), then run "
@@ -460,22 +460,37 @@ async def raid_new(interaction: discord.Interaction, stampprice: float):
         )
         return
 
-    seen = set()
     player_members = []
-    for m in first_msg.mentions:
-        if m.bot or m.id in seen:
-            continue
-        seen.add(m.id)
-        player_members.append(m)
+    for source, msg in candidates:
+        seen = set()
+        found = []
+        for m in msg.mentions:
+            if m.bot or m.id in seen:
+                continue
+            seen.add(m.id)
+            found.append(m)
+        if found:
+            player_members = found
+            print(f"[raid new] using {source} message id={msg.id} -> {len(found)} player(s)")
+            break
 
     if not player_members:
+        # TEMP DEBUG: shows exactly what the bot saw
+        print(f"[raid new] NO mentions. thread.id={thread.id} "
+              f"parent={type(thread.parent).__name__ if thread.parent else None}")
+        for source, msg in candidates:
+            print(f"  {source}: id={msg.id} type={msg.type} author={msg.author} "
+                  f"mentions={[x.id for x in msg.mentions]} "
+                  f"role_mentions={[r.id for r in msg.role_mentions]} "
+                  f"everyone={msg.mention_everyone}")
         await interaction.followup.send(
-            "❌ No player mentions found in this thread's first message. Make sure the "
-            "very first message in this thread @mentions every participant, then run "
+            "❌ No player mentions found in this thread's first messages. Make sure the "
+            "first message in this thread @mentions every participant, then run "
             "`/raid new` again.",
             ephemeral=True,
         )
         return
+       
 
     player_ids = [str(m.id) for m in player_members]
     players = {str(m.id): m.display_name for m in player_members}

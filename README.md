@@ -14,7 +14,7 @@ Stamper's Share = Base Share + (Their Stamps × Stamp Price)
 
 ## 1. Create the Discord Application & Bot
 
-1. Go to https://discord.com/developers/applications → **New Application**.
+1. Go to <https://discord.com/developers/applications> → **New Application**.
 2. Give it a name (e.g. "Loot Share Bot") → Create.
 3. In the left sidebar, click **Bot** → **Add Bot** (or it may already exist).
 4. Click **Reset Token** / **Copy** to get your bot token. **Keep this secret** —
@@ -34,7 +34,7 @@ Stamper's Share = Base Share + (Their Stamps × Stamp Price)
    - `View Channels`
    - `Send Messages`
    - `Send Messages in Threads`
-   - `Read Message History` (needed to read the thread's first message for player mentions)
+   - `Read Message History` (needed to read the thread's opening messages for player mentions)
    - `Manage Threads` (needed to auto-archive a raid thread once everyone confirms)
    - `Use Slash Commands` (implied by `applications.commands`)
 4. Copy the generated URL at the bottom, open it in your browser, and
@@ -45,12 +45,11 @@ so `Create Public Threads` isn't required for the bot.
 
 ## 3. Install & Run
 
-```bash
+```
 pip install -r requirements.txt
 ```
 
-Create a file named `.env` in the same folder as `bot.py` (copy
-`.env.example` and rename it, or create it fresh) containing:
+Create a file named `.env` in the same folder as `bot.py` (copy `.env.example` and rename it, or create it fresh) containing:
 
 ```
 DISCORD_BOT_TOKEN=your-token-here
@@ -58,7 +57,7 @@ DISCORD_BOT_TOKEN=your-token-here
 
 Then just run:
 
-```bash
+```
 python bot.py
 ```
 
@@ -75,38 +74,48 @@ Slash commands can take up to an hour to appear globally the first time;
 if you don't see them right away, try kicking and re-inviting the bot, or
 wait a bit. Restarting the bot re-syncs commands each time it starts.
 
-The bot stores raid data as JSON files under `data/raids/` next to
-`bot.py`, so raids survive a bot restart/crash.
+The bot stores raid data as JSON files under `data/raids/` next to `bot.py`,
+so raids survive a bot restart/crash.
 
 ---
 
 ## How to Use
 
+Not sure what a command does? Run `/help` at any time for a private,
+in-Discord list of every command.
+
 ### 1. Create the thread yourself
 
 Manually create a Discord thread for the raid (title it however you like),
-and in the **very first message** of that thread, `@mention` every player
-who participated:
+and in the opening message of that thread, `@mention` every player who
+participated:
 
 ```
 @Player1 @Player2 @Player3 @Player4
 ```
 
-This message is what the bot reads to figure out the player roster —
-double check everyone is mentioned before moving on.
+This message is what the bot reads to figure out the player roster. The bot
+checks the thread's starter message (if it has one), then the first few
+regular messages in the thread, and uses the **first one that contains
+@mentions**. System messages (like "X started a thread") are skipped.
+Double check everyone is mentioned before moving on.
 
 Both ways of creating the thread work:
 
-- **Threads button → Create → type the message** (the message you type
-  becomes the thread's first message).
+- **Threads button → Create → type the message** (the message you type in
+  the create dialog is posted inside the thread, and the bot reads it from
+  the thread's history).
 - **Right-click an existing message → Create Thread** (that original
   message becomes the thread's "starter message" — the bot specifically
   checks for this case too, since Discord treats it differently from a
-  normal first message).
+  normal message).
 
 If you use the right-click method, make sure the message you're creating
 the thread _from_ is the one with the player mentions — that's the one
 the bot will read.
+
+Mentions must be real Discord mentions (highlighted, usually picked from
+the autocomplete popup). Names typed as plain text are not detected.
 
 ### 2. Start tracking — `/raid new`
 
@@ -118,12 +127,12 @@ Inside that same thread, run:
 
 - `stampprice` — gold cost per stamp for this entire raid (set once here;
   it does not change per item).
-- The bot reads the thread's first message to detect players. If it can't
-  find any mentions, or the thread has no messages yet, it tells you
-  exactly what's wrong so you can fix it and retry.
+- The bot reads the thread's opening messages to detect players (see
+  above). If it can't find any @mentions, or the thread has no messages
+  yet, it tells you exactly what's wrong so you can fix it and retry.
 - On success, the bot posts a confirmation in the thread listing the
-  detected players and stamp price, plus the commands you'll use next
-  (and a reminder that `/help` lists everything if you need it).
+  detected players and stamp price, plus the commands you'll use next.
+  Check that list — if a name is missing or wrong, see `/playeredit`.
 
 ### 3. Record loot — `/drop`
 
@@ -136,8 +145,8 @@ Run once per item collected:
 - `item_name` — free text, any spaces/characters are fine (no underscore
   requirement — this isn't parsed from a bigger block of text anymore).
 - `stamp_qty` — how many stamps this item needed (default `0` if none).
-- `stamper` — the player who paid for the stamp. Required if `stamp_qty`
-  is greater than 0; must be someone on the raid's player list.
+- `stamper` — the player who paid for the stamp. Required if `stamp_qty` is
+  greater than 0; must be someone on the raid's player list.
 - **One item = one stamper.** If two different players stamp items with
   the same name, run `/drop` separately for each — they'll show up as
   separate stock entries.
@@ -188,9 +197,9 @@ at the final confirmation step instead of silently applying.
 
 ### 5. Fix a mistagged player — `/playeredit`
 
-**Raid creator or a server admin only.** Corrects a player who was
-mistagged (or picked wrong) when the raid was created, without needing to
-cancel and restart the whole raid.
+**Raid creator or a server admin only.** If the player list posted by
+`/raid new` has someone missing a tag or the wrong person tagged, this
+corrects the roster without cancelling the raid.
 
 ```
 /playeredit
@@ -198,30 +207,19 @@ cancel and restart the whole raid.
 
 This opens a private, step-by-step flow:
 
-1. **Select the player to fix** from a dropdown of the current roster.
-   Players who are already the stamper on an item that's been sold don't
-   appear here — their stamp bonus is already locked into a completed
-   sale, so they can no longer be swapped out.
-2. **Pick the correct player** using Discord's native member picker (the
-   same kind of picker `/drop` uses for `stamper` — no typing, no risk of
-   a typo).
-3. **Confirm the change** before anything is saved — you'll see the old
-   name and the new one side by side, with a Cancel option right up until
-   you click Confirm.
+1. **Select the player to replace** from a dropdown of the current roster.
+2. **Pick the correct player** using Discord's native member picker.
+3. **Confirm the change** before anything is saved.
 
-The swap updates the roster everywhere it matters: the player list, any
-of their unsold stamped drops (so `/stock` and the final payout still
-credit the right person), and their confirmation status if they'd already
-run `/confirm`. Once confirmed, the bot also **posts publicly** in the
-thread — `old player → new player`, who made the change, and the full
-current roster — so everyone in the raid sees the correction, not just
-whoever ran the command.
+Rules:
 
-It's rejected if the new player is already on the roster, or if
-reassigning would collide with another active drop the new player is
-already stamping under the same item name. Like `/drop` and `/gold`,
-`/playeredit` stops working once the raid's loot has been calculated
-(status `completed` or `closed`).
+- Only works while the raid is `in_progress`. Once the loot is calculated
+  the roster is locked.
+- A player who is the stamper on an item that has already been sold can't
+  be edited (their stamp bonus is already locked into a completed sale);
+  they won't appear in the dropdown.
+- The dropdown shows at most 25 players (Discord's limit for a single
+  select menu).
 
 ### 6. Record extra gold — `/gold`
 
@@ -258,7 +256,7 @@ stock list in the thread.
 
 **Once every unit across every dropped stack has been sold**, the bot
 automatically calculates the full payout and posts it — no extra command
-needed. The result now also shows a running **Total** (gold + everything
+needed. The result also shows a running **Total** (gold + everything
 sold, before stamp deduction) and spells out the Net Pool math as
 `(Total - Stamp Deduction)` so the arithmetic is easy to double-check.
 
@@ -290,8 +288,8 @@ Plus the current raid gold total.
 
 ### 9. Confirm you've been paid — `/confirm`
 
-Once the payout has been calculated and posted, each player runs
-`/confirm` in the thread to acknowledge they received their share:
+Once the payout has been calculated and posted, each player runs `/confirm`
+in the thread to acknowledge they received their share:
 
 - Only counts for players who were on the original roster — anyone else
   running it is told it doesn't count, nothing is tracked.
@@ -324,33 +322,26 @@ confirmed yet.
 Deletes this thread's raid data entirely (only the raid creator or a
 server admin can do this). Useful for starting over after a mistake.
 
-### 13. List every command — `/help`
+### 13. Command list — `/help`
 
-```
-/help
-```
-
-Posts a private (ephemeral) list of every command the bot has, with a
-short explanation of what each one does and who's allowed to run it (🔒
-marks creator/admin-only commands). Unlike the other commands, `/help`
-isn't tied to a raid thread — it works anywhere the bot's slash commands
-are available.
+Shows a private list of every command and what it does. Commands marked
+🔒 are creator/admin only. Unlike the other commands, `/help` can be run
+anywhere, even outside a raid thread.
 
 ---
 
 ## Notes & Limitations
 
-- Each thread holds exactly one raid. Every command (`/drop`, `/dropedit`,
-  `/playeredit`, `/gold`, `/sell`, `/stock`, `/confirm`, and the
+- Each thread holds exactly one raid. Every command (`/drop`, `/gold`,
+  `/sell`, `/stock`, `/confirm`, `/dropedit`, `/playeredit`, and the
   `/raid ...` subcommands) must be run **inside** that raid's thread.
-  `/help` is the one exception — it works anywhere.
-- `/drop`, `/gold`, and `/playeredit` stop working once the raid's loot
-  has been calculated (status `completed` or `closed`) — no changes after
-  the payout is posted.
-- `/playeredit` additionally can't touch a specific player once they're
-  the stamper on an item that's already sold, even while the raid is
-  otherwise still `in_progress` — that stamp bonus is already part of a
-  completed sale.
+  `/help` is the only exception.
+- `/drop` and `/gold` stop working once the raid's loot has been
+  calculated (status `completed` or `closed`) — no changes after the
+  payout is posted.
+- Player detection reads the thread's starter message and first few
+  regular messages, not the whole thread. Put the mentions at the very
+  start of the thread.
 - Timestamps (loot calculated, raid closed) use Discord's dynamic
   timestamp format, so every player automatically sees them converted to
   their own local time zone.
