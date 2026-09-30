@@ -1,4 +1,7 @@
 data/
 .env 
 *.md
-
+deploy.sh
+health_check.sh
+bot.log
+__pycache__/
