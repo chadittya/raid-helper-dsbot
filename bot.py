@@ -45,8 +45,12 @@ components are redacted without it).
 import os
 import re
 import json
+import math
 import uuid
+import asyncio
 import datetime
+import tempfile
+import traceback
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -62,9 +66,54 @@ TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "raids")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# Bumped only when the JSON shape changes in a way that needs a migration.
+# Files written before this field existed have no "schema_version" but are
+# still current (they have "drops"); they pick the field up on the next save.
+SCHEMA_VERSION = 3
+
+
+class RaidDataError(Exception):
+    """A raid file exists but can't be used (corrupt, legacy, or too new)."""
+
+
+def _reject_constant(name: str):
+    """json parse hook: refuse NaN/Infinity so an already-poisoned file fails
+    with a clear error instead of loading a raid whose payout renders 'nan'."""
+    raise ValueError(f"non-finite number {name} in raid file")
+
+
+def _has_non_finite(value) -> bool:
+    """True if the parsed structure contains a nan/inf float anywhere.
+
+    parse_constant alone is not enough: json accepts overflowing literals
+    like 1e999, which the float scanner turns into inf without ever calling
+    the hook, so the loaded tree needs its own check."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(_has_non_finite(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_non_finite(v) for v in value)
+    return False
+
+
 # --------------------------------------------------------------------------
 # Storage helpers
 # --------------------------------------------------------------------------
+
+# One asyncio.Lock per thread, created lazily. Every command is a
+# read-modify-write of the whole raid dict, so overlapping handlers would
+# otherwise lose each other's writes (e.g. two /sell modals both seeing the
+# same pre-save snapshot, or two /confirm s racing).
+_raid_locks: dict[int, asyncio.Lock] = {}
+
+
+def get_raid_lock(thread_id: int) -> asyncio.Lock:
+    lock = _raid_locks.get(thread_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _raid_locks[thread_id] = lock
+    return lock
 
 
 def raid_path(thread_id: int) -> str:
@@ -72,23 +121,74 @@ def raid_path(thread_id: int) -> str:
 
 
 def load_raid(thread_id: int):
+    """Return the raid dict for this thread, None if there is no file, or
+    raise RaidDataError if the file exists but can't be used. Every caller
+    relies on this distinction -- never return a half-valid dict."""
     path = raid_path(thread_id)
     if not os.path.exists(path):
         return None
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raid = json.load(f, parse_constant=_reject_constant)
+    except (OSError, ValueError) as e:
+        raise RaidDataError(
+            f"this thread's raid file is unreadable ({type(e).__name__})"
+        ) from e
+    if not isinstance(raid, dict):
+        raise RaidDataError("this thread's raid file is not a valid raid record")
+    if _has_non_finite(raid):
+        raise RaidDataError(
+            "this thread's raid file contains a non-finite number (nan/inf)"
+        )
+    # Version is checked before the shape, so a future schema that renames
+    # or drops "drops" is reported as too new rather than told to /raid cancel.
+    version = raid.get("schema_version")
+    if isinstance(version, int) and version > SCHEMA_VERSION:
+        raise RaidDataError(
+            "this raid was created by a newer version of the bot than I'm running"
+        )
+    if isinstance(version, int) and version < SCHEMA_VERSION:
+        raise RaidDataError("this raid uses an older data format that I can no longer read")
+    if "drops" not in raid:
+        raise RaidDataError(
+            "this raid was created by an older version of the bot and can no longer be "
+            "read. Run `/raid cancel` in this thread to clear it, then start a new raid."
+        )
+    raid.setdefault("schema_version", SCHEMA_VERSION)  # persisted on the next save
+    return raid
 
 
 def save_raid(raid: dict):
+    """Write atomically: full contents to a temp file in the same directory,
+    fsync, then os.replace over the real file. A crash mid-write can never
+    leave a truncated raid file behind."""
     path = raid_path(raid["thread_id"])
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(raid, f, indent=2)
+    fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(raid, f, indent=2, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def delete_raid(thread_id: int):
     path = raid_path(thread_id)
     if os.path.exists(path):
         os.remove(path)
+    # Only drop the lock entry if nobody holds it. Evicting a lock the caller
+    # is still inside (e.g. /raid cancel deleting under its own lock) would let
+    # get_raid_lock hand out a *second* lock for the same thread, and the two
+    # would no longer exclude each other.
+    lock = _raid_locks.get(thread_id)
+    if lock is not None and not lock.locked():
+        _raid_locks.pop(thread_id, None)
 
 
 # --------------------------------------------------------------------------
@@ -365,7 +465,14 @@ async def ack_and_announce(interaction: discord.Interaction, thread, content: st
 # --------------------------------------------------------------------------
 
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Item names and other user text are echoed back into bot messages, so never
+# let a typed "@everyone"/"@role" actually ping. Individual <@id> mentions are
+# still allowed -- the roster, /confirm receipts, and DM-failure notices need them.
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents,
+    allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
+)
 
 
 @bot.event
@@ -375,6 +482,51 @@ async def on_ready():
         print(f"Logged in as {bot.user}. Synced {len(synced)} command(s).")
     except Exception as e:
         print(f"Command sync failed: {e}")
+
+
+async def _report_interaction_error(interaction: discord.Interaction, error, *, where: str):
+    """Tell the user what went wrong on an ephemeral reply, and print a
+    traceback for anything unexpected. Without this a failed handler leaves
+    the interaction stuck on 'thinking...' forever, since load_raid raises
+    RaidDataError instead of returning a junk dict."""
+    if isinstance(error, RaidDataError):
+        message = f"❌ {error}"
+    else:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        message = (
+            f"❌ Something went wrong {where}. It may not have completed — "
+            f"check the thread (e.g. `/stock`) before retrying."
+        )
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    # discord.py wraps whatever the command raised in CommandInvokeError.
+    await _report_interaction_error(
+        interaction, getattr(error, "original", error), where="handling this command"
+    )
+
+
+class RaidView(discord.ui.View):
+    """View whose errors get reported to the user. discord.py's default
+    View.on_error only logs, which would silently strand a menu."""
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item, /):
+        await _report_interaction_error(interaction, error, where="in this menu")
+
+
+class RaidModal(discord.ui.Modal):
+    """Modal counterpart to RaidView."""
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, /):
+        await _report_interaction_error(interaction, error, where="in this form")
 
 
 # --------------------------------------------------------------------------
@@ -410,6 +562,12 @@ async def get_thread_intro_candidates(thread: discord.Thread, limit: int = 10):
     return candidates
 
 
+RAID_ALREADY_STARTED_MSG = (
+    "❌ A raid has already been started in this thread. Use `/raid cancel` first "
+    "if you need to restart it."
+)
+
+
 @raid_group.command(
     name="new",
     description="Start a new raid in this thread (players auto-detected from the thread's first message)",
@@ -426,11 +584,16 @@ async def raid_new(interaction: discord.Interaction, stampprice: float):
         )
         return
 
+    # Fast, friendly rejection before we read any history. The authoritative
+    # check is re-done under the raid lock just before the save, so two
+    # concurrent /raid new calls can't both create a raid for this thread.
     if load_raid(thread.id):
+        await interaction.response.send_message(RAID_ALREADY_STARTED_MSG, ephemeral=True)
+        return
+
+    if not math.isfinite(stampprice):
         await interaction.response.send_message(
-            "❌ A raid has already been started in this thread. Use `/raid cancel` first "
-            "if you need to restart it.",
-            ephemeral=True,
+            "❌ Stamp price must be a finite number.", ephemeral=True
         )
         return
 
@@ -497,6 +660,7 @@ async def raid_new(interaction: discord.Interaction, stampprice: float):
     created_ts = now_ts()
 
     raid = {
+        "schema_version": SCHEMA_VERSION,
         "guild_id": interaction.guild.id,
         "thread_id": thread.id,
         "created_by": interaction.user.id,
@@ -510,7 +674,13 @@ async def raid_new(interaction: discord.Interaction, stampprice: float):
         "confirmed": [],
         "status": "in_progress",
     }
-    save_raid(raid)
+    async with get_raid_lock(thread.id):
+        # Re-check under the lock: two people can run /raid new concurrently,
+        # and the fast check above happened before we read the history.
+        if load_raid(thread.id):
+            await interaction.followup.send(RAID_ALREADY_STARTED_MSG, ephemeral=True)
+            return
+        save_raid(raid)
 
     mentions_str = " ".join(f"<@{pid}>" for pid in player_ids)
     success_msg = (
@@ -558,76 +728,77 @@ async def drop_cmd(
         )
         return
 
-    raid = load_raid(thread.id)
-    if not raid:
-        await interaction.followup.send(
-            "❌ No raid found in this thread. Run `/raid new` first.", ephemeral=True
-        )
-        return
+    async with get_raid_lock(thread.id):
+        raid = load_raid(thread.id)
+        if not raid:
+            await interaction.followup.send(
+                "❌ No raid found in this thread. Run `/raid new` first.", ephemeral=True
+            )
+            return
 
-    if raid["status"] != "in_progress":
-        await interaction.followup.send(
-            "❌ This raid's loot has already been calculated/closed — no more drops can "
-            "be added.",
-            ephemeral=True,
-        )
-        return
+        if raid["status"] != "in_progress":
+            await interaction.followup.send(
+                "❌ This raid's loot has already been calculated/closed — no more drops can "
+                "be added.",
+                ephemeral=True,
+            )
+            return
 
-    item_name_clean = item_name.strip()
-    if not item_name_clean:
-        await interaction.followup.send(
-            "❌ Item name cannot be empty.", ephemeral=True
-        )
-        return
+        item_name_clean = item_name.strip()
+        if not item_name_clean:
+            await interaction.followup.send(
+                "❌ Item name cannot be empty.", ephemeral=True
+            )
+            return
 
-    if stamp_qty < 0:
-        await interaction.followup.send(
-            "❌ Stamp qty cannot be negative.", ephemeral=True
-        )
-        return
+        if stamp_qty < 0:
+            await interaction.followup.send(
+                "❌ Stamp qty cannot be negative.", ephemeral=True
+            )
+            return
 
-    if stamp_qty > 0 and stamper is None:
-        await interaction.followup.send(
-            "❌ A stamper must be selected when `stamp_qty` is greater than 0.",
-            ephemeral=True,
-        )
-        return
+        if stamp_qty > 0 and stamper is None:
+            await interaction.followup.send(
+                "❌ A stamper must be selected when `stamp_qty` is greater than 0.",
+                ephemeral=True,
+            )
+            return
 
-    if stamp_qty == 0:
-        stamper = None
+        if stamp_qty == 0:
+            stamper = None
 
-    if stamper is not None and str(stamper.id) not in raid["player_ids"]:
-        await interaction.followup.send(
-            f"❌ {stamper.display_name} isn't part of this raid's player list.",
-            ephemeral=True,
-        )
-        return
+        if stamper is not None and str(stamper.id) not in raid["player_ids"]:
+            await interaction.followup.send(
+                f"❌ {stamper.display_name} isn't part of this raid's player list.",
+                ephemeral=True,
+            )
+            return
 
-    stamper_id = str(stamper.id) if stamper else None
-    match_key = compute_match_key(item_name_clean, stamper_id)
+        stamper_id = str(stamper.id) if stamper else None
+        match_key = compute_match_key(item_name_clean, stamper_id)
 
-    # Merge into an existing ACTIVE (not fully sold) group with the same
-    # item name + stamper. If the only matching group is fully sold, start
-    # a fresh one instead (that one is a closed transaction).
-    entry = None
-    for g in raid["drops"]:
-        if g["match_key"] == match_key and group_remaining(g) > 0:
-            entry = g
-            break
+        # Merge into an existing ACTIVE (not fully sold) group with the same
+        # item name + stamper. If the only matching group is fully sold, start
+        # a fresh one instead (that one is a closed transaction).
+        entry = None
+        for g in raid["drops"]:
+            if g["match_key"] == match_key and group_remaining(g) > 0:
+                entry = g
+                break
 
-    if entry:
-        entry["units"].append({"stamp_qty": stamp_qty, "sold": False})
-    else:
-        entry = {
-            "id": uuid.uuid4().hex,
-            "match_key": match_key,
-            "item_name": item_name_clean,
-            "stamper_id": stamper_id,
-            "units": [{"stamp_qty": stamp_qty, "sold": False}],
-        }
-        raid["drops"].append(entry)
+        if entry:
+            entry["units"].append({"stamp_qty": stamp_qty, "sold": False})
+        else:
+            entry = {
+                "id": uuid.uuid4().hex,
+                "match_key": match_key,
+                "item_name": item_name_clean,
+                "stamper_id": stamper_id,
+                "units": [{"stamp_qty": stamp_qty, "sold": False}],
+            }
+            raid["drops"].append(entry)
 
-    save_raid(raid)
+        save_raid(raid)
 
     total = stamp_qty * raid["stampprice"]
     stamper_mention = f"<@{stamper_id}>" if stamper_id else "None"
@@ -664,29 +835,37 @@ async def gold_cmd(interaction: discord.Interaction, amount: float):
         )
         return
 
-    raid = load_raid(thread.id)
-    if not raid:
-        await interaction.followup.send(
-            "❌ No raid found in this thread. Run `/raid new` first.", ephemeral=True
-        )
-        return
+    async with get_raid_lock(thread.id):
+        raid = load_raid(thread.id)
+        if not raid:
+            await interaction.followup.send(
+                "❌ No raid found in this thread. Run `/raid new` first.", ephemeral=True
+            )
+            return
 
-    if raid["status"] != "in_progress":
-        await interaction.followup.send(
-            "❌ This raid's loot has already been calculated/closed — gold can no longer "
-            "be changed.",
-            ephemeral=True,
-        )
-        return
+        if raid["status"] != "in_progress":
+            await interaction.followup.send(
+                "❌ This raid's loot has already been calculated/closed — gold can no longer "
+                "be changed.",
+                ephemeral=True,
+            )
+            return
 
-    if amount < 0:
-        await interaction.followup.send(
-            "❌ Gold cannot be negative.", ephemeral=True
-        )
-        return
+        if not math.isfinite(amount):
+            await interaction.followup.send(
+                "❌ Gold amount must be a finite number.", ephemeral=True
+            )
+            return
 
-    raid["gold"] = amount
-    save_raid(raid)
+        if amount < 0:
+            await interaction.followup.send(
+                "❌ Gold cannot be negative.", ephemeral=True
+            )
+            return
+
+        raid["gold"] = amount
+        save_raid(raid)
+
     await ack_and_announce(
         interaction, thread, f"**Raid Gold recorded successfully!**\n\nGold: {fmt_gold(amount)}G"
     )
@@ -739,7 +918,7 @@ async def safe_edit_origin(origin_interaction: discord.Interaction, fallback_int
             pass
 
 
-class ConfirmEditView(discord.ui.View):
+class ConfirmEditView(RaidView):
     """Final Cancel/Confirm step shared by all three edit fields. `pending`
     carries everything needed to re-validate and apply the change:
     {thread_id, drop_id, field, new_value}."""
@@ -769,82 +948,83 @@ class ConfirmEditView(discord.ui.View):
         drop_id = self.pending["drop_id"]
         field = self.pending["field"]
 
-        # Re-fetch fresh and re-validate everything before touching data --
-        # concurrency protection in case something changed since this
-        # confirmation screen was shown.
-        raid = load_raid(thread_id)
-        if not raid:
-            await interaction.response.edit_message(content=RAID_GONE_MSG, view=None)
-            return
-        drop = next((g for g in raid["drops"] if g["id"] == drop_id), None)
-        if not drop:
-            await interaction.response.edit_message(content=DROP_GONE_MSG, view=None)
-            return
-        if not drop_is_editable(drop):
-            await interaction.response.edit_message(content=CANNOT_EDIT_SOLD_MSG, view=None)
-            return
-
-        if field == "item_name":
-            new_name = self.pending["new_value"]
-            new_key = compute_match_key(new_name, drop["stamper_id"])
-            if has_active_match_key_conflict(raid, drop_id, new_key):
-                await interaction.response.edit_message(content=DUPLICATE_MATCH_MSG, view=None)
+        async with get_raid_lock(thread_id):
+            # Re-fetch fresh and re-validate everything before touching data --
+            # concurrency protection in case something changed since this
+            # confirmation screen was shown.
+            raid = load_raid(thread_id)
+            if not raid:
+                await interaction.response.edit_message(content=RAID_GONE_MSG, view=None)
                 return
-            old_name = drop["item_name"]
-            drop["item_name"] = new_name
-            drop["match_key"] = new_key
-            success = (
-                "✅ Drop updated successfully.\n\n"
-                f"{old_name}\n→ {new_name}\n\n"
-                f"Stamp: {stamp_display_for(drop)}\n"
-                f"Stamper: {stamper_display_for(drop)}"
-            )
-
-        elif field == "stamp_qty":
-            if len(drop["units"]) != 1:
-                await interaction.response.edit_message(content=MULTI_UNIT_STAMP_MSG, view=None)
+            drop = next((g for g in raid["drops"] if g["id"] == drop_id), None)
+            if not drop:
+                await interaction.response.edit_message(content=DROP_GONE_MSG, view=None)
                 return
-            old_qty = drop["units"][0]["stamp_qty"]
-            new_qty = self.pending["new_value"]
-            drop["units"][0]["stamp_qty"] = new_qty
-            success = (
-                "✅ Drop updated successfully.\n\n"
-                f"{drop['item_name']}\n\n"
-                f"Stamp:\n{old_qty} → {new_qty}"
-            )
+            if not drop_is_editable(drop):
+                await interaction.response.edit_message(content=CANNOT_EDIT_SOLD_MSG, view=None)
+                return
 
-        elif field == "stamper":
-            new_stamper_id = self.pending["new_value"]
-            if new_stamper_id not in raid["player_ids"]:
+            if field == "item_name":
+                new_name = self.pending["new_value"]
+                new_key = compute_match_key(new_name, drop["stamper_id"])
+                if has_active_match_key_conflict(raid, drop_id, new_key):
+                    await interaction.response.edit_message(content=DUPLICATE_MATCH_MSG, view=None)
+                    return
+                old_name = drop["item_name"]
+                drop["item_name"] = new_name
+                drop["match_key"] = new_key
+                success = (
+                    "✅ Drop updated successfully.\n\n"
+                    f"{old_name}\n→ {new_name}\n\n"
+                    f"Stamp: {stamp_display_for(drop)}\n"
+                    f"Stamper: {stamper_display_for(drop)}"
+                )
+
+            elif field == "stamp_qty":
+                if len(drop["units"]) != 1:
+                    await interaction.response.edit_message(content=MULTI_UNIT_STAMP_MSG, view=None)
+                    return
+                old_qty = drop["units"][0]["stamp_qty"]
+                new_qty = self.pending["new_value"]
+                drop["units"][0]["stamp_qty"] = new_qty
+                success = (
+                    "✅ Drop updated successfully.\n\n"
+                    f"{drop['item_name']}\n\n"
+                    f"Stamp:\n{old_qty} → {new_qty}"
+                )
+
+            elif field == "stamper":
+                new_stamper_id = self.pending["new_value"]
+                if new_stamper_id not in raid["player_ids"]:
+                    await interaction.response.edit_message(
+                        content="❌ That player isn't part of this raid.", view=None
+                    )
+                    return
+                new_key = compute_match_key(drop["item_name"], new_stamper_id)
+                if has_active_match_key_conflict(raid, drop_id, new_key):
+                    await interaction.response.edit_message(content=DUPLICATE_MATCH_MSG, view=None)
+                    return
+                old_display = stamper_display_for(drop)
+                drop["stamper_id"] = new_stamper_id
+                drop["match_key"] = new_key
+                success = (
+                    "✅ Drop updated successfully.\n\n"
+                    f"{drop['item_name']}\n\n"
+                    f"Stamper:\n{old_display} → <@{new_stamper_id}>"
+                )
+            else:
+                await interaction.response.edit_message(content="❌ Unknown edit type.", view=None)
+                return
+
+            try:
+                save_raid(raid)
+            except Exception:
                 await interaction.response.edit_message(
-                    content="❌ That player isn't part of this raid.", view=None
+                    content="❌ Failed to save changes. Please try again.", view=None
                 )
                 return
-            new_key = compute_match_key(drop["item_name"], new_stamper_id)
-            if has_active_match_key_conflict(raid, drop_id, new_key):
-                await interaction.response.edit_message(content=DUPLICATE_MATCH_MSG, view=None)
-                return
-            old_display = stamper_display_for(drop)
-            drop["stamper_id"] = new_stamper_id
-            drop["match_key"] = new_key
-            success = (
-                "✅ Drop updated successfully.\n\n"
-                f"{drop['item_name']}\n\n"
-                f"Stamper:\n{old_display} → <@{new_stamper_id}>"
-            )
-        else:
-            await interaction.response.edit_message(content="❌ Unknown edit type.", view=None)
-            return
 
-        try:
-            save_raid(raid)
-        except Exception:
-            await interaction.response.edit_message(
-                content="❌ Failed to save changes. Please try again.", view=None
-            )
-            return
-
-        await interaction.response.edit_message(content=success, view=None)
+            await interaction.response.edit_message(content=success, view=None)
 
 
 async def finish_modal_edit(modal_interaction: discord.Interaction, origin_interaction: discord.Interaction, content: str, view=None):
@@ -858,7 +1038,7 @@ async def finish_modal_edit(modal_interaction: discord.Interaction, origin_inter
         pass
 
 
-class ItemNameEditModal(discord.ui.Modal, title="Edit Item Name"):
+class ItemNameEditModal(RaidModal, title="Edit Item Name"):
     def __init__(self, requester_id: int, thread_id: int, drop_id: str, current_name: str, origin_interaction: discord.Interaction):
         super().__init__()
         self.requester_id = requester_id
@@ -920,7 +1100,7 @@ class ItemNameEditModal(discord.ui.Modal, title="Edit Item Name"):
         await finish_modal_edit(interaction, self.origin_interaction, content, confirm_view)
 
 
-class StampQtyEditModal(discord.ui.Modal, title="Edit Stamp Quantity"):
+class StampQtyEditModal(RaidModal, title="Edit Stamp Quantity"):
     def __init__(self, requester_id: int, thread_id: int, drop_id: str, current_qty: int, origin_interaction: discord.Interaction):
         super().__init__()
         self.requester_id = requester_id
@@ -1041,7 +1221,7 @@ class StamperSelect(discord.ui.Select):
         await interaction.response.edit_message(content=content, view=confirm_view)
 
 
-class StamperSelectView(discord.ui.View):
+class StamperSelectView(RaidView):
     def __init__(self, requester_id: int, thread_id: int, drop_id: str, options):
         super().__init__(timeout=300)
         self.requester_id = requester_id
@@ -1058,7 +1238,7 @@ class StamperSelectView(discord.ui.View):
         return True
 
 
-class EditMenuView(discord.ui.View):
+class EditMenuView(RaidView):
     def __init__(self, requester_id: int, thread_id: int, drop_id: str, origin_interaction: discord.Interaction):
         super().__init__(timeout=300)
         self.requester_id = requester_id
@@ -1198,7 +1378,7 @@ class DropSelect(discord.ui.Select):
         await interaction.response.edit_message(content=content, view=edit_view)
 
 
-class DropEditSelectView(discord.ui.View):
+class DropEditSelectView(RaidView):
     def __init__(self, requester_id: int, thread_id: int, options):
         super().__init__(timeout=300)
         self.requester_id = requester_id
@@ -1355,7 +1535,7 @@ def apply_player_swap(raid: dict, old_id: str, new_id: str, new_name: str):
     raid["confirmed"] = [new_id if pid == old_id else pid for pid in confirmed]
 
 
-class PlayerEditConfirmView(discord.ui.View):
+class PlayerEditConfirmView(RaidView):
     """Final Cancel/Confirm step. `pending` carries everything needed to
     re-validate and apply the swap: {thread_id, old_id, new_id, new_name}."""
 
@@ -1385,47 +1565,48 @@ class PlayerEditConfirmView(discord.ui.View):
         new_id = self.pending["new_id"]
         new_name = self.pending["new_name"]
 
-        # Re-fetch fresh and re-validate everything before touching data --
-        # concurrency protection in case a sale went through, or the raid
-        # changed some other way, while this confirmation screen was open.
-        raid = load_raid(thread_id)
-        if not raid:
-            await interaction.response.edit_message(content=PLAYER_RAID_GONE_MSG, view=None)
-            return
-        if raid["status"] != "in_progress":
-            await interaction.response.edit_message(content=PLAYER_RAID_LOCKED_MSG, view=None)
-            return
-        if old_id not in raid["player_ids"]:
-            await interaction.response.edit_message(content=PLAYER_GONE_MSG, view=None)
-            return
-        if player_has_sold_stamp_bond(raid, old_id):
-            await interaction.response.edit_message(content=PLAYER_NOT_EDITABLE_MSG, view=None)
-            return
-        if new_id in raid["player_ids"]:
-            await interaction.response.edit_message(content=PLAYER_ALREADY_ON_ROSTER_MSG, view=None)
-            return
-        conflict_item = find_player_swap_conflict(raid, old_id, new_id)
-        if conflict_item:
-            await interaction.response.edit_message(
-                content=(
-                    "❌ Cannot update this player.\n\n"
-                    f"The new player already has another active stamped drop for "
-                    f"**{conflict_item}** — that would collide with it."
-                ),
-                view=None,
-            )
-            return
+        async with get_raid_lock(thread_id):
+            # Re-fetch fresh and re-validate everything before touching data --
+            # concurrency protection in case a sale went through, or the raid
+            # changed some other way, while this confirmation screen was open.
+            raid = load_raid(thread_id)
+            if not raid:
+                await interaction.response.edit_message(content=PLAYER_RAID_GONE_MSG, view=None)
+                return
+            if raid["status"] != "in_progress":
+                await interaction.response.edit_message(content=PLAYER_RAID_LOCKED_MSG, view=None)
+                return
+            if old_id not in raid["player_ids"]:
+                await interaction.response.edit_message(content=PLAYER_GONE_MSG, view=None)
+                return
+            if player_has_sold_stamp_bond(raid, old_id):
+                await interaction.response.edit_message(content=PLAYER_NOT_EDITABLE_MSG, view=None)
+                return
+            if new_id in raid["player_ids"]:
+                await interaction.response.edit_message(content=PLAYER_ALREADY_ON_ROSTER_MSG, view=None)
+                return
+            conflict_item = find_player_swap_conflict(raid, old_id, new_id)
+            if conflict_item:
+                await interaction.response.edit_message(
+                    content=(
+                        "❌ Cannot update this player.\n\n"
+                        f"The new player already has another active stamped drop for "
+                        f"**{conflict_item}** — that would collide with it."
+                    ),
+                    view=None,
+                )
+                return
 
-        old_name = raid["players"].get(old_id, old_id)
-        apply_player_swap(raid, old_id, new_id, new_name)
+            old_name = raid["players"].get(old_id, old_id)
+            apply_player_swap(raid, old_id, new_id, new_name)
 
-        try:
-            save_raid(raid)
-        except Exception:
-            await interaction.response.edit_message(
-                content="❌ Failed to save changes. Please try again.", view=None
-            )
-            return
+            try:
+                save_raid(raid)
+            except Exception:
+                await interaction.response.edit_message(
+                    content="❌ Failed to save changes. Please try again.", view=None
+                )
+                return
 
         # Public announcement so the rest of the raid sees the correction
         # and the up-to-date roster, not just the person who ran the
@@ -1518,7 +1699,7 @@ class NewPlayerSelect(discord.ui.UserSelect):
         await interaction.response.edit_message(content=content, view=confirm_view)
 
 
-class NewPlayerSelectView(discord.ui.View):
+class NewPlayerSelectView(RaidView):
     def __init__(self, requester_id: int, thread_id: int, old_id: str):
         super().__init__(timeout=300)
         self.requester_id = requester_id
@@ -1568,7 +1749,7 @@ class PlayerSelect(discord.ui.Select):
         await interaction.response.edit_message(content=content, view=new_view)
 
 
-class PlayerEditSelectView(discord.ui.View):
+class PlayerEditSelectView(RaidView):
     def __init__(self, requester_id: int, thread_id: int, options):
         super().__init__(timeout=300)
         self.requester_id = requester_id
@@ -1652,7 +1833,7 @@ async def playeredit_cmd(interaction: discord.Interaction):
 # --------------------------------------------------------------------------
 
 
-class SellDetailsModal(discord.ui.Modal, title="Sell Item"):
+class SellDetailsModal(RaidModal, title="Sell Item"):
     def __init__(self, group_id: str, remaining_at_open: int):
         super().__init__()
         self.group_id = group_id
@@ -1706,6 +1887,12 @@ class SellDetailsModal(discord.ui.Modal, title="Sell Item"):
             )
             return
 
+        if not math.isfinite(price):
+            await interaction.followup.send(
+                "❌ Sold price must be a finite number.", ephemeral=True
+            )
+            return
+
         thread = interaction.channel
         if not isinstance(thread, discord.Thread):
             await interaction.followup.send(
@@ -1713,85 +1900,90 @@ class SellDetailsModal(discord.ui.Modal, title="Sell Item"):
             )
             return
 
-        raid = load_raid(thread.id)
-        if not raid:
-            await interaction.followup.send(
-                "❌ No raid found in this thread (it may have been cancelled).",
-                ephemeral=True,
-            )
-            return
-
-        entry = next((g for g in raid["drops"] if g["id"] == self.group_id), None)
-        if not entry:
-            await interaction.followup.send(
-                "❌ That stock line no longer exists.", ephemeral=True
-            )
-            return
-
-        remaining = group_remaining(entry)
-        if remaining == 0:
-            await interaction.followup.send(
-                f"❌ `{entry['item_name']}` is already fully sold.", ephemeral=True
-            )
-            return
-
-        if qty_sold < 1 or qty_sold > remaining:
-            await interaction.followup.send(
-                f"❌ Quantity sold must be between 1 and {remaining} "
-                f"(the current remaining amount for `{entry['item_name']}`).",
-                ephemeral=True,
-            )
-            return
-
-        # Mark the first `qty_sold` unsold units as sold
-        marked = 0
-        for u in entry["units"]:
-            if marked >= qty_sold:
-                break
-            if not u["sold"]:
-                u["sold"] = True
-                marked += 1
-
-        raid.setdefault("sales", []).append(
-            {
-                "group_id": entry["id"],
-                "item_name": entry["item_name"],
-                "stamper_id": entry["stamper_id"],
-                "qty": qty_sold,
-                "price": price,
-                "ts": now_ts(),
-            }
-        )
-        save_raid(raid)
-
-        new_status = group_status(entry)
-        stock_lines = build_stock_lines(raid)
-        stock_str = "\n".join(stock_lines) if stock_lines else "_(none)_"
-
-        msg = (
-            "**One or more item is SOLD!**\n\n"
-            f"{entry['item_name']} x{qty_sold} sold at {fmt_gold(price)}G "
-            f"(now {new_status})\n\n"
-            f"**Remaining Stock:**\n{stock_str}"
-        )
-        await ack_and_announce(interaction, thread, msg)
-
-        if all_fully_sold(raid):
-            raid["completed_at_ts"] = now_ts()
-            result_text = calculate_and_format(raid)
-            raid["status"] = "completed"
-            raid["confirmed"] = []
-            save_raid(raid)
-            await thread.send(result_text)
-
-            failed_dms = await send_salary_dms(interaction.client, raid)
-            if failed_dms:
-                mentions = " ".join(f"<@{pid}>" for pid in failed_dms)
-                await thread.send(
-                    "⚠️ Couldn't DM the following players their salary summary "
-                    f"(they may have DMs disabled) — please notify them manually: "
-                    f"{mentions}"
+        # Everything from the re-read through the payout decision happens under
+        # the raid lock: two open /sell modals used to validate against the same
+        # pre-save snapshot, then both mark units sold and both post the payout
+        # and DM every player their salary.
+        async with get_raid_lock(thread.id):
+            raid = load_raid(thread.id)
+            if not raid:
+                await interaction.followup.send(
+                    "❌ No raid found in this thread (it may have been cancelled).",
+                    ephemeral=True,
                 )
+                return
+
+            entry = next((g for g in raid["drops"] if g["id"] == self.group_id), None)
+            if not entry:
+                await interaction.followup.send(
+                    "❌ That stock line no longer exists.", ephemeral=True
+                )
+                return
+
+            remaining = group_remaining(entry)
+            if remaining == 0:
+                await interaction.followup.send(
+                    f"❌ `{entry['item_name']}` is already fully sold.", ephemeral=True
+                )
+                return
+
+            if qty_sold < 1 or qty_sold > remaining:
+                await interaction.followup.send(
+                    f"❌ Quantity sold must be between 1 and {remaining} "
+                    f"(the current remaining amount for `{entry['item_name']}`).",
+                    ephemeral=True,
+                )
+                return
+
+            # Mark the first `qty_sold` unsold units as sold
+            marked = 0
+            for u in entry["units"]:
+                if marked >= qty_sold:
+                    break
+                if not u["sold"]:
+                    u["sold"] = True
+                    marked += 1
+
+            raid.setdefault("sales", []).append(
+                {
+                    "group_id": entry["id"],
+                    "item_name": entry["item_name"],
+                    "stamper_id": entry["stamper_id"],
+                    "qty": qty_sold,
+                    "price": price,
+                    "ts": now_ts(),
+                }
+            )
+            save_raid(raid)
+
+            new_status = group_status(entry)
+            stock_lines = build_stock_lines(raid)
+            stock_str = "\n".join(stock_lines) if stock_lines else "_(none)_"
+
+            msg = (
+                "**One or more item is SOLD!**\n\n"
+                f"{entry['item_name']} x{qty_sold} sold at {fmt_gold(price)}G "
+                f"(now {new_status})\n\n"
+                f"**Remaining Stock:**\n{stock_str}"
+            )
+            await ack_and_announce(interaction, thread, msg)
+
+            if all_fully_sold(raid):
+                raid["completed_at_ts"] = now_ts()
+                result_text = calculate_and_format(raid)
+                raid["status"] = "completed"
+                raid["confirmed"] = []
+                save_raid(raid)
+                await thread.send(result_text)
+
+                failed_dms = await send_salary_dms(interaction.client, raid)
+                if failed_dms:
+                    mentions = " ".join(f"<@{pid}>" for pid in failed_dms)
+                    await thread.send(
+                        "⚠️ Couldn't DM the following players their salary summary "
+                        f"(they may have DMs disabled) — please notify them manually: "
+                        f"{mentions}"
+                    )
 
 
 class ItemSelect(discord.ui.Select):
@@ -1806,7 +1998,7 @@ class ItemSelect(discord.ui.Select):
         await interaction.response.send_modal(modal)
 
 
-class SellSelectView(discord.ui.View):
+class SellSelectView(RaidView):
     def __init__(self, requester_id: int, options, remaining_by_value):
         super().__init__(timeout=300)
         self.requester_id = requester_id
@@ -1924,7 +2116,10 @@ async def stock_cmd(interaction: discord.Interaction):
 
 async def finalize_if_all_confirmed(raid: dict, thread: discord.Thread) -> bool:
     """If every player has confirmed, close out the raid: mark it closed,
-    post a summary, and archive the thread. Returns True if it closed."""
+    post a summary, and archive the thread. Returns True if it closed.
+
+    Must only be called while already holding this thread's raid lock --
+    both callers (/confirm, /raid forceconfirm) do."""
     confirmed = raid.get("confirmed", [])
     total = len(raid["player_ids"])
     if len(confirmed) < total:
@@ -1962,51 +2157,54 @@ async def confirm(interaction: discord.Interaction):
         )
         return
 
-    raid = load_raid(thread.id)
-    if not raid:
-        await interaction.followup.send(
-            "No raid data found for this thread.", ephemeral=True
-        )
-        return
+    async with get_raid_lock(thread.id):
+        raid = load_raid(thread.id)
+        if not raid:
+            await interaction.followup.send(
+                "No raid data found for this thread.", ephemeral=True
+            )
+            return
 
-    if raid["status"] == "in_progress":
-        await interaction.followup.send(
-            "The loot for this raid hasn't been calculated yet — wait until all items "
-            "are marked sold first.",
-            ephemeral=True,
-        )
-        return
+        if raid["status"] == "in_progress":
+            await interaction.followup.send(
+                "The loot for this raid hasn't been calculated yet — wait until all items "
+                "are marked sold first.",
+                ephemeral=True,
+            )
+            return
 
-    uid = str(interaction.user.id)
-    if uid not in raid["player_ids"]:
-        await interaction.followup.send(
-            "You're not on the player roster for this raid, so this doesn't count as a "
-            "confirmation.",
-            ephemeral=True,
-        )
-        return
+        uid = str(interaction.user.id)
+        if uid not in raid["player_ids"]:
+            await interaction.followup.send(
+                "You're not on the player roster for this raid, so this doesn't count as a "
+                "confirmation.",
+                ephemeral=True,
+            )
+            return
 
-    if raid["status"] == "closed":
-        await interaction.followup.send(
-            "This raid is already fully confirmed and closed.", ephemeral=True
-        )
-        return
+        if raid["status"] == "closed":
+            await interaction.followup.send(
+                "This raid is already fully confirmed and closed.", ephemeral=True
+            )
+            return
 
-    confirmed = raid.setdefault("confirmed", [])
-    if uid in confirmed:
-        await interaction.followup.send(
-            "You've already confirmed for this raid.", ephemeral=True
-        )
-        return
+        confirmed = raid.setdefault("confirmed", [])
+        if uid in confirmed:
+            await interaction.followup.send(
+                "You've already confirmed for this raid.", ephemeral=True
+            )
+            return
 
-    confirmed.append(uid)
-    save_raid(raid)
+        confirmed.append(uid)
+        save_raid(raid)
 
-    total = len(raid["player_ids"])
-    count = len(confirmed)
-    await ack_and_announce(interaction, thread, f"✅ <@{uid}> confirmed receipt. ({count}/{total})")
+        total = len(raid["player_ids"])
+        count = len(confirmed)
+        await ack_and_announce(interaction, thread, f"✅ <@{uid}> confirmed receipt. ({count}/{total})")
 
-    await finalize_if_all_confirmed(raid, thread)
+        # Already holding this thread's lock -- finalize_if_all_confirmed must
+        # not take it again (asyncio.Lock is not reentrant).
+        await finalize_if_all_confirmed(raid, thread)
 
 
 @raid_group.command(
@@ -2027,64 +2225,66 @@ async def raid_forceconfirm(interaction: discord.Interaction, player: discord.Me
         )
         return
 
-    raid = load_raid(thread.id)
-    if not raid:
-        await interaction.followup.send(
-            "No raid data found for this thread.", ephemeral=True
+    async with get_raid_lock(thread.id):
+        raid = load_raid(thread.id)
+        if not raid:
+            await interaction.followup.send(
+                "No raid data found for this thread.", ephemeral=True
+            )
+            return
+
+        is_creator = interaction.user.id == raid["created_by"]
+        is_admin = (
+            isinstance(interaction.user, discord.Member)
+            and interaction.user.guild_permissions.administrator
         )
-        return
+        if not (is_creator or is_admin):
+            await interaction.followup.send(
+                "Only the raid creator or a server admin can force-confirm a player.",
+                ephemeral=True,
+            )
+            return
 
-    is_creator = interaction.user.id == raid["created_by"]
-    is_admin = (
-        isinstance(interaction.user, discord.Member)
-        and interaction.user.guild_permissions.administrator
-    )
-    if not (is_creator or is_admin):
-        await interaction.followup.send(
-            "Only the raid creator or a server admin can force-confirm a player.",
-            ephemeral=True,
+        if raid["status"] == "in_progress":
+            await interaction.followup.send(
+                "The loot for this raid hasn't been calculated yet.", ephemeral=True
+            )
+            return
+
+        uid = str(player.id)
+        if uid not in raid["player_ids"]:
+            await interaction.followup.send(
+                f"{player.display_name} isn't on this raid's player roster.", ephemeral=True
+            )
+            return
+
+        if raid["status"] == "closed":
+            await interaction.followup.send(
+                "This raid is already fully confirmed and closed.", ephemeral=True
+            )
+            return
+
+        confirmed = raid.setdefault("confirmed", [])
+        if uid in confirmed:
+            await interaction.followup.send(
+                f"{player.display_name} has already confirmed.", ephemeral=True
+            )
+            return
+
+        confirmed.append(uid)
+        save_raid(raid)
+
+        total = len(raid["player_ids"])
+        count = len(confirmed)
+        await ack_and_announce(
+            interaction,
+            thread,
+            f"✅ <@{uid}> marked as confirmed by {interaction.user.mention} (manual override). "
+            f"({count}/{total})",
         )
-        return
 
-    if raid["status"] == "in_progress":
-        await interaction.followup.send(
-            "The loot for this raid hasn't been calculated yet.", ephemeral=True
-        )
-        return
-
-    uid = str(player.id)
-    if uid not in raid["player_ids"]:
-        await interaction.followup.send(
-            f"{player.display_name} isn't on this raid's player roster.", ephemeral=True
-        )
-        return
-
-    if raid["status"] == "closed":
-        await interaction.followup.send(
-            "This raid is already fully confirmed and closed.", ephemeral=True
-        )
-        return
-
-    confirmed = raid.setdefault("confirmed", [])
-    if uid in confirmed:
-        await interaction.followup.send(
-            f"{player.display_name} has already confirmed.", ephemeral=True
-        )
-        return
-
-    confirmed.append(uid)
-    save_raid(raid)
-
-    total = len(raid["player_ids"])
-    count = len(confirmed)
-    await ack_and_announce(
-        interaction,
-        thread,
-        f"✅ <@{uid}> marked as confirmed by {interaction.user.mention} (manual override). "
-        f"({count}/{total})",
-    )
-
-    await finalize_if_all_confirmed(raid, thread)
+        # Already holding this thread's lock -- see the note in `confirm`.
+        await finalize_if_all_confirmed(raid, thread)
 
 
 @raid_group.command(name="status", description="Show raid status and confirmation progress")
@@ -2135,14 +2335,28 @@ async def raid_cancel(interaction: discord.Interaction):
             "This command must be used inside a raid thread.", ephemeral=True
         )
         return
-    raid = load_raid(thread.id)
-    if not raid:
+    try:
+        raid = load_raid(thread.id)
+        creator_id = raid.get("created_by") if raid else None
+    except RaidDataError:
+        # The file exists but is unusable (corrupt, or written by an old
+        # version). /raid cancel is the only escape hatch from that state, so
+        # keep working: fall back to a best-effort raw read purely to identify
+        # the creator. A file too broken to parse at all is admin-only.
+        raid = None
+        try:
+            with open(raid_path(thread.id), "r", encoding="utf-8") as f:
+                creator_id = json.load(f).get("created_by")
+        except (OSError, ValueError, AttributeError):
+            creator_id = None
+
+    if raid is None and creator_id is None:
         await interaction.followup.send(
             "No raid data found for this thread.", ephemeral=True
         )
         return
 
-    is_creator = interaction.user.id == raid["created_by"]
+    is_creator = creator_id is not None and interaction.user.id == creator_id
     is_admin = (
         isinstance(interaction.user, discord.Member)
         and interaction.user.guild_permissions.administrator
@@ -2153,7 +2367,8 @@ async def raid_cancel(interaction: discord.Interaction):
         )
         return
 
-    delete_raid(thread.id)
+    async with get_raid_lock(thread.id):
+        delete_raid(thread.id)
     await ack_and_announce(interaction, thread, "🗑️ Raid data cancelled/deleted for this thread.")
 
 

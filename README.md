@@ -126,7 +126,8 @@ Inside that same thread, run:
 ```
 
 - `stampprice` — gold cost per stamp for this entire raid (set once here;
-  it does not change per item).
+  it does not change per item). It must be a normal (finite) number and
+  cannot be negative — `nan`/`inf` are rejected.
 - The bot reads the thread's opening messages to detect players (see
   above). If it can't find any @mentions, or the thread has no messages
   yet, it tells you exactly what's wrong so you can fix it and retry.
@@ -229,7 +230,8 @@ Rules:
 
 Sets the raid's flat gold amount. **Each call overwrites the previous
 value** — it does not add up, so if you need to correct it, just run it
-again with the right total.
+again with the right total. The amount must be a normal (finite) number
+and cannot be negative — `nan`/`inf` are rejected.
 
 ### 7. Sell an item — `/sell`
 
@@ -247,7 +249,8 @@ still has unsold units. Pick one, and a popup asks for two things:
   you're selling in _this_ transaction, not a per-unit price. If the rest
   of the stack sells later at a different price, just run `/sell` again
   for the remaining units — each sale is tracked separately and all of
-  them add up toward the final payout.
+  them add up toward the final payout. The price must be a normal (finite)
+  number and cannot be negative — `nan`/`inf` are rejected.
 
 Selling fewer than the full remaining amount marks that line **PARTIALLY
 SOLD** with the reduced remaining quantity; selling the last remaining
@@ -322,6 +325,12 @@ confirmed yet.
 Deletes this thread's raid data entirely (only the raid creator or a
 server admin can do this). Useful for starting over after a mistake.
 
+This is also the way out of an **unreadable raid file** (corrupted on
+disk, or written by an older version of the bot — see the Upgrade note
+below). Every other command in that thread reports an error instead of
+working, but `/raid cancel` still reads enough of the file to check the
+creator and deletes it so you can start fresh.
+
 ### 13. Command list — `/help`
 
 Shows a private list of every command and what it does. Commands marked
@@ -357,9 +366,21 @@ anywhere, even outside a raid thread.
   wrong" popup under network delay — acknowledging first, before any
   processing, avoids that regardless of how long the actual work takes
   afterward.
+- Commands in the same thread are processed one at a time. If two people
+  act at the same moment (two `/sell` popups, two `/confirm`s), the second
+  one waits its turn and then re-checks the latest state, so a sale or a
+  confirmation can't be silently overwritten. Different threads never
+  block each other.
+- Raid files are written atomically (whole file, then swapped into place),
+  so interrupting the bot mid-write can never leave a half-written file.
+- If a thread's raid file ever can't be read (corrupted, or from an
+  incompatible version), the affected command replies with a clear error
+  instead of hanging — and `/raid cancel` still works to clear it.
 - If you ever need to reset everything, stop the bot and delete the
   `data/raids/` folder — this wipes all raid history.
 - **Upgrade note:** this version changed how drops are stored internally
-  (to support partial sales). Any raid created with an older version of
-  this bot won't be readable by this version — cancel it with
-  `/raid cancel` and start fresh with `/raid new` after upgrading.
+  (to support partial sales). Raid files now carry a `schema_version`
+  field; ones written before it existed are still read normally (the
+  field is added the next time that raid is written). Any raid created
+  with an older version of this bot won't be readable at all — cancel it
+  with `/raid cancel` and start fresh with `/raid new` after upgrading.
