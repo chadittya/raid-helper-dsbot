@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Edit(./data/**)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(git push:*)"
+    ]
+  }
+}

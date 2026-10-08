@@ -5,3 +5,6 @@ deploy.sh
 health_check.sh
 bot.log
 __pycache__/
+.claude/settings.local.json
+.venv/
+!CLAUDE.md
