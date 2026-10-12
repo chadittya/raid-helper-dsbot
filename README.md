@@ -152,11 +152,16 @@ Run once per item collected:
   the same name, run `/drop` separately for each — they'll show up as
   separate stock entries.
 - Dropping the **same item name by the same stamper again** merges into
-  that stack: quantity goes up (`x2`, `x3`, ...) and stamp counts add
-  together (e.g. two drops of 3 stamps each = 6 total stamps for that
-  stack).
+  that stack — but only while that stack still has unsold units. Quantity
+  goes up (`x2`, `x3`, ...) and stamp counts add together (e.g. two drops
+  of 3 stamps each = 6 total stamps for that stack). Once a stack is
+  **fully sold**, it's a closed transaction: a later `/drop` for the same
+  item + stamper starts a **fresh stack**, so that item will appear as two
+  separate lines.
 - Each successful `/drop` posts a confirmation with that drop's own stamp
-  cost, plus the full current remaining (unsold) stock list.
+  cost, plus the full current stock list, labelled **Raid Stock** — every
+  drop in the raid so far, including lines that have already sold out
+  (shown as `x0` … `SOLD`).
 
 ### 4. Fix a mistake — `/dropedit`
 
@@ -167,7 +172,13 @@ without needing to cancel and restart the whole raid.
 /dropedit
 ```
 
-This opens a private, step-by-step flow:
+Only works while the raid is `in_progress` — once the loot has been
+calculated and posted, `/dropedit` replies
+`🔒 This raid has already been finalized. Drops can no longer be edited.`
+and changes nothing.
+
+This opens a private, step-by-step flow (unlike `/playeredit`, it never
+posts anything publicly in the thread):
 
 1. **Select a drop** from a dropdown of all currently unsold drops (e.g.
    `D01 • Dragon Scale — 3 stamps • Nyan`). Drops that are already SOLD or
@@ -211,6 +222,10 @@ This opens a private, step-by-step flow:
 1. **Select the player to replace** from a dropdown of the current roster.
 2. **Pick the correct player** using Discord's native member picker.
 3. **Confirm the change** before anything is saved.
+4. On confirm, the bot also posts a **public** `🔧 **Player Roster Updated**`
+   message in the thread — the old → new player, who made the change, and
+   the refreshed roster — so the rest of the raid sees the correction, not
+   just you. (The step-by-step flow above stays private to you.)
 
 Rules:
 
@@ -262,6 +277,16 @@ automatically calculates the full payout and posts it — no extra command
 needed. The result also shows a running **Total** (gold + everything
 sold, before stamp deduction) and spells out the Net Pool math as
 `(Total - Stamp Deduction)` so the arithmetic is easy to double-check.
+
+**Decimals:** shares are not rounded to whole gold. The base share is the
+Net Pool divided by the number of players, kept as-is and only *displayed*
+to 2 decimal places (a whole number prints without decimals, e.g. `50G`).
+So with a 100G Net Pool and 3 players, everyone is shown `33.33G` each —
+`33.33 × 3 = 99.99G`, and the leftover fraction is **not** redistributed to
+anyone. That means the printed shares can add up to slightly less (or
+more) than the printed Net Pool; it's a rounding display artifact, not a
+missing payment. A stamper's stamp bonus is added on top of that same base
+share.
 
 Right after posting the result in the thread, the bot also **DMs every
 player individually** with their own share amount and a link button back
@@ -318,7 +343,8 @@ last one needed.
 
 Shows the raid's current phase (`in_progress` / `completed` / `closed`),
 when it started, and — once loot is calculated — who has and hasn't
-confirmed yet.
+confirmed yet. This is a private reply: only you see it, nothing is posted
+in the thread.
 
 ### 12. Cancel a raid — `/raid cancel`
 
@@ -345,9 +371,9 @@ anywhere, even outside a raid thread.
   `/sell`, `/stock`, `/confirm`, `/dropedit`, `/playeredit`, and the
   `/raid ...` subcommands) must be run **inside** that raid's thread.
   `/help` is the only exception.
-- `/drop` and `/gold` stop working once the raid's loot has been
-  calculated (status `completed` or `closed`) — no changes after the
-  payout is posted.
+- `/drop`, `/gold`, `/dropedit`, and `/playeredit` stop working once the
+  raid's loot has been calculated (status `completed` or `closed`) — no
+  changes after the payout is posted.
 - Player detection reads the thread's starter message and first few
   regular messages, not the whole thread. Put the mentions at the very
   start of the thread.
@@ -360,12 +386,16 @@ anywhere, even outside a raid thread.
   who has that setting off (or has blocked the bot) simply can't be
   reached, and will be called out in the thread instead.
 - Every command acknowledges Discord's interaction immediately (before
-  doing any work), then posts its real result as a normal thread message.
-  Discord interactions expire ~3 seconds after being created if not
-  acknowledged right away, which can occasionally cause a "Something went
-  wrong" popup under network delay — acknowledging first, before any
-  processing, avoids that regardless of how long the actual work takes
-  afterward.
+  doing any work). Most then post their real result as a normal thread
+  message that everyone can see, but a few stay private to whoever ran
+  them: `/raid status` and `/help` reply only to you and never post in the
+  thread, `/dropedit`'s entire step-by-step flow is private (it posts
+  nothing publicly), and `/sell`'s dropdown is private while the result of
+  the popup it opens *is* posted publicly. Discord interactions expire ~3
+  seconds after being created if not acknowledged right away, which can
+  occasionally cause a "Something went wrong" popup under network delay —
+  acknowledging first, before any processing, avoids that regardless of how
+  long the actual work takes afterward.
 - Commands in the same thread are processed one at a time. If two people
   act at the same moment (two `/sell` popups, two `/confirm`s), the second
   one waits its turn and then re-checks the latest state, so a sale or a

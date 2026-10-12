@@ -810,7 +810,7 @@ async def drop_cmd(
         f"item name: {item_name_clean}\n"
         f"stamp: {stamp_qty} × {fmt_gold(raid['stampprice'])}G = {fmt_gold(total)}G\n"
         f"stampers: {stamper_mention}\n\n"
-        f"**Remaining Stock:**\n{remaining_str}"
+        f"**Raid Stock:**\n{remaining_str}"
     )
     await ack_and_announce(interaction, thread, msg)
 
@@ -1964,7 +1964,7 @@ class SellDetailsModal(RaidModal, title="Sell Item"):
                 "**One or more item is SOLD!**\n\n"
                 f"{entry['item_name']} x{qty_sold} sold at {fmt_gold(price)}G "
                 f"(now {new_status})\n\n"
-                f"**Remaining Stock:**\n{stock_str}"
+                f"**Raid Stock:**\n{stock_str}"
             )
             await ack_and_announce(interaction, thread, msg)
 
@@ -2402,7 +2402,9 @@ async def help_cmd(interaction: discord.Interaction):
         name="/drop `item_name` `stamp_qty` `stamper`",
         value=(
             "Records one dropped unit. Run once per item that drops — running it "
-            "again with the same item name + stamper merges into the same stack. "
+            "again with the same item name + stamper merges into the same stack, "
+            "as long as that stack still has unsold units; once it's sold out, a "
+            "re-drop starts a fresh stack. "
             "`stamper` is required only if `stamp_qty` is greater than 0."
         ),
         inline=False,
