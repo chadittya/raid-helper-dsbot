@@ -15,7 +15,7 @@ Windows/local dev data lives in `data/raids/` (gitignored). Deleting that folder
 
 ## Architecture
 
-Everything lives in one ~2300-line `bot.py`. There is no package layout — read the file top-to-bottom; it is organized as a flat sequence of (1) storage helpers, (2) formatting/payout helpers, (3) bot setup, (4) one section per command with its UI classes immediately above it.
+Everything lives in one ~2600-line `bot.py`. There is no package layout — read the file top-to-bottom; it is organized as a flat sequence of (1) storage helpers, (2) formatting/payout helpers, (3) bot setup, (4) one section per command with its UI classes immediately above it.
 
 ### State: one JSON file per thread
 
@@ -105,5 +105,5 @@ When the last unit sells (`all_fully_sold`), `/sell` itself sets `completed_at_t
 
 ## Known limitations
 
-- No locking and no cache: every command reads and rewrites the whole JSON file, so two commands at the same moment can overwrite each other.
+- Locking is per-thread and in-process, and there is no cache: `get_raid_lock` (bot.py:108-116) serialises commands within one thread, so two `/sell` popups or two `/confirm`s can't overwrite each other, but every command still re-reads and rewrites the whole JSON file. `/dropedit` and `/playeredit` take no lock at all and rely on re-validating at their final Confirm instead.
 - All logic is in one large bot.py; no tests (manual testing in an isolated Discord test channel).

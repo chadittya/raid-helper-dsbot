@@ -392,9 +392,9 @@ anywhere, even outside a raid thread.
   `/sell`, `/stock`, `/confirm`, `/dropedit`, `/playeredit`, and the
   `/raid ...` subcommands) must be run **inside** that raid's thread.
   `/help` is the only exception.
-- `/drop`, `/gold`, `/dropedit`, and `/playeredit` stop working once the
-  raid's loot has been calculated (status `completed` or `closed`) — no
-  changes after the payout is posted.
+- `/drop`, `/gold`, `/sell`, `/dropedit`, and `/playeredit` stop working
+  once the raid's loot has been calculated (status `completed` or
+  `closed`) — no changes after the payout is posted.
 - Player detection reads the thread's starter message and first few
   regular messages, not the whole thread. Put the mentions at the very
   start of the thread.
