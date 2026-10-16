@@ -461,6 +461,37 @@ async def ack_and_announce(interaction: discord.Interaction, thread, content: st
 
 
 # --------------------------------------------------------------------------
+# Creator/admin permission gate
+# --------------------------------------------------------------------------
+
+# /drop, /gold and /sell change the pool every other player is paid from, so
+# they are locked to the raid creator or a server admin -- the same predicate
+# /dropedit and /playeredit inline. This is the predicate written once for the
+# newer commands; the older four keep their own copy untouched.
+# The helper only *decides*: each call site still sends its own refusal, since
+# /drop and /gold have already deferred (followup) while /sell has not
+# (response.send_message) and its modal has deferred again.
+
+
+def is_raid_privileged(interaction: discord.Interaction, raid: dict) -> bool:
+    """True if the caller is this raid's creator or a guild administrator."""
+    if interaction.user.id == raid["created_by"]:
+        return True
+    return (
+        isinstance(interaction.user, discord.Member)
+        and interaction.user.guild_permissions.administrator
+    )
+
+
+def raid_privilege_refusal(raid: dict, cmd: str) -> str:
+    """Shared refusal text; `cmd` is the bare command name, e.g. "drop"."""
+    return (
+        f"🔒 Only the raid creator (<@{raid['created_by']}>) or a server admin "
+        f"can use `/{cmd}`."
+    )
+
+
+# --------------------------------------------------------------------------
 # Bot setup
 # --------------------------------------------------------------------------
 
@@ -736,6 +767,15 @@ async def drop_cmd(
             )
             return
 
+        # Inside the lock, on the snapshot just loaded: who may add drops is
+        # checked before the status and before any input validation, so a
+        # refusal never leaks which of the two would have applied.
+        if not is_raid_privileged(interaction, raid):
+            await interaction.followup.send(
+                raid_privilege_refusal(raid, "drop"), ephemeral=True
+            )
+            return
+
         if raid["status"] != "in_progress":
             await interaction.followup.send(
                 "❌ This raid's loot has already been calculated/closed — no more drops can "
@@ -840,6 +880,12 @@ async def gold_cmd(interaction: discord.Interaction, amount: float):
         if not raid:
             await interaction.followup.send(
                 "❌ No raid found in this thread. Run `/raid new` first.", ephemeral=True
+            )
+            return
+
+        if not is_raid_privileged(interaction, raid):
+            await interaction.followup.send(
+                raid_privilege_refusal(raid, "gold"), ephemeral=True
             )
             return
 
@@ -1913,6 +1959,18 @@ class SellDetailsModal(RaidModal, title="Sell Item"):
                 )
                 return
 
+            # Re-checked here because this is where the sale is actually
+            # recorded: /sell's own gate only guards the dropdown, and the
+            # view's interaction_check binds that dropdown to a person, not to
+            # a permission. Covers the popup being submitted after the raid was
+            # cancelled and restarted under someone else, or after the caller
+            # lost Administrator. Deferred in on_submit, so followup.
+            if not is_raid_privileged(interaction, raid):
+                await interaction.followup.send(
+                    raid_privilege_refusal(raid, "sell"), ephemeral=True
+                )
+                return
+
             entry = next((g for g in raid["drops"] if g["id"] == self.group_id), None)
             if not entry:
                 await interaction.followup.send(
@@ -2026,6 +2084,14 @@ async def sell_cmd(interaction: discord.Interaction):
     if not raid:
         await interaction.response.send_message(
             "❌ No raid found in this thread. Run `/raid new` first.", ephemeral=True
+        )
+        return
+
+    # This command never defers, so every reply here goes through `response`,
+    # not `followup`. Same predicate as /drop and /gold.
+    if not is_raid_privileged(interaction, raid):
+        await interaction.response.send_message(
+            raid_privilege_refusal(raid, "sell"), ephemeral=True
         )
         return
 
@@ -2399,7 +2465,7 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
-        name="/drop `item_name` `stamp_qty` `stamper`",
+        name="🔒 /drop `item_name` `stamp_qty` `stamper`",
         value=(
             "Records one dropped unit. Run once per item that drops — running it "
             "again with the same item name + stamper merges into the same stack, "
@@ -2428,7 +2494,7 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
-        name="/gold `amount`",
+        name="🔒 /gold `amount`",
         value=(
             "Sets the raid's flat extra gold. **Overwrites** the previous value "
             "each time (not additive) — re-run it to correct a mistake."
@@ -2436,7 +2502,7 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
-        name="/sell",
+        name="🔒 /sell",
         value=(
             "Opens a private dropdown of stock that still has unsold units. Pick "
             "one, then enter the quantity sold and total price for that sale "

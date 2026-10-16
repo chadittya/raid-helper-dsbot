@@ -58,13 +58,18 @@ Every command follows the same shape and should keep doing so:
 3. **Acknowledge immediately** (`defer(ephemeral=True)`) before any work, wrapped in `try/except discord.HTTPException`. Discord interactions expire in ~3s.
 4. Post the _real_ result as a normal thread message via `ack_and_announce`, which then best-effort sends "✅ Done." ephemerally. Errors are still delivered through `interaction.followup.send(..., ephemeral=True)`.
 
-Permission gates are `is_creator = interaction.user.id == raid["created_by"]` OR `interaction.user.guild_permissions.administrator`, applied on `/dropedit`, `/playeredit`, `/raid forceconfirm`, `/raid cancel`. Copy this exact check rather than inventing a new one.
+Permission gates are `is_creator = interaction.user.id == raid["created_by"]` OR `interaction.user.guild_permissions.administrator`. They apply to every command that changes the value other players are paid from: `/drop`, `/gold`, `/sell`, `/dropedit`, `/playeredit`, `/raid forceconfirm`, `/raid cancel`. New commands use the shared `is_raid_privileged(interaction, raid)` predicate plus `raid_privilege_refusal(raid, cmd)`, both defined in the "Creator/admin permission gate" section above the bot setup — never invent a new check. The four older commands (`/dropedit`, `/playeredit`, `/raid forceconfirm`, `/raid cancel`) still carry their own inline copy and three slightly different refusal wordings; leave those alone unless asked.
 
-Multi-step flows (`/dropedit`, `/playeredit`, `/sell`) are chains of `discord.ui.View` subclasses defined right above their command. Two rules in these chains:
+Where the gate goes matters, because the refusal must travel the same path as the interaction's state:
+
+- `/drop` and `/gold` defer first, then take the raid lock, so their gate sits **inside the lock**, right after `if not raid` and **before** the status check and input validation — it reuses the snapshot already loaded and refusals go through `followup`.
+- `/sell` never defers in `sell_cmd` (every reply there is `interaction.response.send_message`), so its entry gate must reply through `response`, **not** `followup`. It also re-checks inside `SellDetailsModal.on_submit` after re-loading the raid under the lock, because that is where the sale is actually recorded — the entry gate only guards the dropdown, and the view's `interaction_check` binds the dropdown to a person, not to a permission.
+
+Multi-step flows (`/dropedit`, `/playeredit`, `/sell`) are chains of `discord.ui.View` subclasses defined right above their command. Rules in these chains:
 
 - Each view overrides `interaction_check` to lock the flow to `requester_id`.
 - Select menus cap at 25 options (Discord's limit); the code truncates and appends a "only the first 25 are shown" note.
-- Before applying a mutation at the final Confirm, the flow **re-fetches the raid and re-validates everything** (drop still exists, still unsold, no match-key conflict, raid still `in_progress`) — see `ConfirmEditView.confirm_btn` and `PlayerEditConfirmView.confirm_btn`. Keep this guard when adding fields.
+- Before applying a mutation at the final Confirm, the flow **re-fetches the raid and re-validates everything** (drop still exists, still unsold, no match-key conflict, raid still `in_progress`) — see `ConfirmEditView.confirm_btn`, `PlayerEditConfirmView.confirm_btn`, and `SellDetailsModal.on_submit`, which re-checks privilege for the same reason. Keep this guard when adding fields.
 - Ephemeral interaction responses are not real messages: to rewrite them you need `edit_original_response()` on the _same_ interaction that produced them (`safe_edit_origin`) — `Message.edit()` will 404.
 
 ### Player detection (`/raid new`)

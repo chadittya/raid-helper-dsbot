@@ -137,6 +137,12 @@ Inside that same thread, run:
 
 ### 3. Record loot — `/drop`
 
+**Raid creator or a server admin only.** A drop decides who gets a stamp
+bonus and how much the pool is reduced by, so only the raid creator or a
+server administrator can record one. Everyone else gets a private
+`🔒 Only the raid creator (<@name>) or a server admin can use /drop.`
+reply and nothing is recorded.
+
 Run once per item collected:
 
 ```
@@ -239,6 +245,10 @@ Rules:
 
 ### 6. Record extra gold — `/gold`
 
+**Raid creator or a server admin only** — this value feeds straight into
+everyone's share, so a regular member running it gets a private refusal and
+the stored gold is left untouched.
+
 ```
 /gold amount:258
 ```
@@ -249,6 +259,17 @@ again with the right total. The amount must be a normal (finite) number
 and cannot be negative — `nan`/`inf` are rejected.
 
 ### 7. Sell an item — `/sell`
+
+**Raid creator or a server admin only.** The price entered here is what the
+whole raid gets paid for that item, so only the raid creator or a server
+administrator can open the dropdown — a regular member gets the private
+refusal instead of the menu.
+
+The permission is checked a second time when the popup is submitted, right
+before anything is saved. So if the raid is cancelled and restarted by
+someone else (or you lose your admin rights) while the popup is still open,
+the sale is **refused** rather than applied — a stale popup can never record
+a sale against a raid you no longer control.
 
 ```
 /sell
