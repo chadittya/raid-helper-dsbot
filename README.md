@@ -140,7 +140,7 @@ Inside that same thread, run:
 **Raid creator or a server admin only.** A drop decides who gets a stamp
 bonus and how much the pool is reduced by, so only the raid creator or a
 server administrator can record one. Everyone else gets a private
-`🔒 Only the raid creator (<@name>) or a server admin can use /drop.`
+``🔒 Only the raid creator (<@name>) or a server admin can use `/drop`.``
 reply and nothing is recorded.
 
 Run once per item collected:

@@ -8,17 +8,18 @@ Flow:
   2. /raid new stampprice:<X>   -> reads player mentions from that first
      message, creates the raid record for this thread.
   3. /drop item_name:<X> [stamp_qty:<N>] [stamper:<@player>]
-        -> records ONE dropped unit of an item. Re-dropping the same item
-           name by the same stamper (while any earlier units of that
-           stack are still unsold) merges into that stack: displayed
-           quantity goes up, and each unit keeps its own stamp count so a
-           later partial sale can carry the exact stamps for the units
-           actually sold.
-  4. /gold amount:<X>   -> sets (overwrites) the raid's extra gold.
-  5. /sell   -> pick a stock line from a dropdown (only lines with unsold
-        units remaining), then a popup asks how many units were sold
-        (prefilled with the full remaining amount, editable) and the
-        total sold price for that batch. Selling fewer than the full
+        -> creator/admin only. Records ONE dropped unit of an item.
+           Re-dropping the same item name by the same stamper (while any
+           earlier units of that stack are still unsold) merges into that
+           stack: displayed quantity goes up, and each unit keeps its own
+           stamp count so a later partial sale can carry the exact stamps
+           for the units actually sold.
+  4. /gold amount:<X>   -> creator/admin only. Sets (overwrites) the raid's
+        extra gold.
+  5. /sell   -> creator/admin only. Pick a stock line from a dropdown (only
+        lines with unsold units remaining), then a popup asks how many
+        units were sold (prefilled with the full remaining amount, editable)
+        and the total sold price for that batch. Selling fewer than the full
         remaining amount marks that line PARTIALLY SOLD; selling the last
         remaining unit marks it SOLD. Once every unit across every stack
         is sold, the payout is calculated and posted automatically.
@@ -717,9 +718,9 @@ async def raid_new(interaction: discord.Interaction, stampprice: float):
     success_msg = (
         "**New Raid Created successfully!**\n\n"
         "Next action:\n"
-        "- use `/drop` for listing current raid drop and stampers\n"
-        "- use `/sell` for selling current drop\n"
-        "- use `/gold` for list additional current raid gold\n"
+        "- use `/drop` for listing current raid drop and stampers (creator/admin only)\n"
+        "- use `/sell` for selling current drop (creator/admin only)\n"
+        "- use `/gold` for list additional current raid gold (creator/admin only)\n"
         "- use `/stock` for checking current drop stock and the stock update\n\n"
         "if you need help use command `/help`\n\n"
         f"👥 Players detected: {mentions_str}\n"
@@ -735,7 +736,10 @@ async def raid_new(interaction: discord.Interaction, stampprice: float):
 # --------------------------------------------------------------------------
 
 
-@bot.tree.command(name="drop", description="Record a loot drop for the current raid")
+@bot.tree.command(
+    name="drop",
+    description="Record a loot drop for the current raid (creator/admin only)",
+)
 @app_commands.describe(
     item_name="Name of the item",
     stamp_qty="Number of stamps used on this unit (0 if none needed)",
@@ -860,7 +864,10 @@ async def drop_cmd(
 # --------------------------------------------------------------------------
 
 
-@bot.tree.command(name="gold", description="Set the raid's additional gold (overwrites the previous value)")
+@bot.tree.command(
+    name="gold",
+    description="Set the raid's additional gold (overwrites the previous value, creator/admin only)",
+)
 @app_commands.describe(amount="Total additional gold for this raid")
 async def gold_cmd(interaction: discord.Interaction, amount: float):
     try:
@@ -2071,7 +2078,9 @@ class SellSelectView(RaidView):
         return True
 
 
-@bot.tree.command(name="sell", description="Mark units of a raid item as sold")
+@bot.tree.command(
+    name="sell", description="Mark units of a raid item as sold (creator/admin only)"
+)
 async def sell_cmd(interaction: discord.Interaction):
     thread = interaction.channel
     if not isinstance(thread, discord.Thread):

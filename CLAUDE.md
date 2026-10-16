@@ -23,7 +23,7 @@ Everything lives in one ~2600-line `bot.py`. There is no package layout — read
 
 `in_progress` → (last unit sold) → `completed` → (all players confirmed) → `closed`
 
-`in_progress` is the only state where `/drop`, `/gold`, `/dropedit`, and `/playeredit` are allowed.
+`in_progress` is the only state where `/drop`, `/gold`, `/sell`, `/dropedit`, and `/playeredit` are allowed.
 
 ### The drop/unit model (key invariant)
 
@@ -69,7 +69,8 @@ Multi-step flows (`/dropedit`, `/playeredit`, `/sell`) are chains of `discord.ui
 
 - Each view overrides `interaction_check` to lock the flow to `requester_id`.
 - Select menus cap at 25 options (Discord's limit); the code truncates and appends a "only the first 25 are shown" note.
-- Before applying a mutation at the final Confirm, the flow **re-fetches the raid and re-validates everything** (drop still exists, still unsold, no match-key conflict, raid still `in_progress`) — see `ConfirmEditView.confirm_btn`, `PlayerEditConfirmView.confirm_btn`, and `SellDetailsModal.on_submit`, which re-checks privilege for the same reason. Keep this guard when adding fields.
+- Before applying a mutation at the final Confirm, the flow **re-fetches the raid and re-validates everything** (drop still exists, still unsold, no match-key conflict, raid still `in_progress`) — see `ConfirmEditView.confirm_btn`, `PlayerEditConfirmView.confirm_btn` and `SellDetailsModal.on_submit`. Keep this guard when adding fields.
+- Only `SellDetailsModal.on_submit` re-checks **privilege** at that point, because it is the step that writes a sale. The two `confirm_btn`s re-validate state only and rely on their command's entry gate plus the view's `interaction_check`; that is safe only while those views stay ephemeral and requester-locked, so add a privilege re-check there too if either of those ever changes.
 - Ephemeral interaction responses are not real messages: to rewrite them you need `edit_original_response()` on the _same_ interaction that produced them (`safe_edit_origin`) — `Message.edit()` will 404.
 
 ### Player detection (`/raid new`)
@@ -105,5 +106,5 @@ When the last unit sells (`all_fully_sold`), `/sell` itself sets `completed_at_t
 
 ## Known limitations
 
-- Locking is per-thread and in-process, and there is no cache: `get_raid_lock` (bot.py:108-116) serialises commands within one thread, so two `/sell` popups or two `/confirm`s can't overwrite each other, but every command still re-reads and rewrites the whole JSON file. `/dropedit` and `/playeredit` take no lock at all and rely on re-validating at their final Confirm instead.
+- Locking is per-thread and in-process, and there is no cache: `get_raid_lock` (bot.py:104-116) serialises commands within one thread, so two `/sell` popups or two `/confirm`s can't overwrite each other, but every command still re-reads and rewrites the whole JSON file. Every mutation path takes that lock — including the `/dropedit` and `/playeredit` final Confirm steps (`ConfirmEditView.confirm_btn`, `PlayerEditConfirmView.confirm_btn`); those two commands' entry checks run before it, on an unlocked read. The lock is **not reentrant** (bot.py:2272 warns about this), so never wrap a body that already holds it.
 - All logic is in one large bot.py; no tests (manual testing in an isolated Discord test channel).
